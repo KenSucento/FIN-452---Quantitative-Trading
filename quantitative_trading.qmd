@@ -1,0 +1,677 @@
+---
+title: "FIN 452 — Quantitative Trading Strategy"
+subtitle: "Clustering + Kalman Filter | S&P 500 Select Sector ETFs"
+author: "Ken Sucento"
+date: "April 7, 2026"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    toc-title: "Contents"
+    theme: flatly
+    number-sections: true
+---
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+library(tidyverse)
+library(tidyquant)
+library(tidymodels)
+library(rlang)
+library(purrr)
+library(lubridate)
+library(plotly)
+library(patchwork)
+library(gt)
+library(cluster)
+library(factoextra)
+library(tseries)
+library(KFAS)
+library(broom)
+library(slider)
+library(TTR)
+library(PerformanceAnalytics)
+library(RTL)
+```
+
+## Mental Model — How the Strategy Came to Life
+
+The strategy answers one question: *"Can two sector ETFs that historically move together be traded profitably when their spread temporarily diverges?"* The answer requires four sequential filters — each one narrows the universe from many candidates to one actionable pair and a concrete trading rule. The diagram below shows the full lifecycle from hypothesis to evaluation.
+
+```{mermaid}
+graph TD
+    subgraph HYPOTHESIS["<b>Hypothesis</b>"]
+        H1["Sector ETFs share systematic risk<br/>→ their spreads should mean-revert"]
+    end
+
+    subgraph DATA["<b>Data Layer</b>"]
+        D1["tidyquant::tq_get<br/>12 SPDR ETFs | Jun 2000 – Mar 2026<br/>Adjusted Close + Open Prices"]
+        D2["Train / Test Split<br/>Train: Jun 2000 – Dec 2024<br/>Test: Jan 2025 – Mar 2026<br/>No information leakage"]
+        D3["Log Returns + Log Prices<br/>Log returns for clustering<br/>Log prices for cointegration & Kalman"]
+    end
+
+    subgraph FILTER["<b>4-Step Filter Pipeline (Train Only)</b>"]
+        F1["<b>Step 1: Clustering</b><br/>K-Means k = 3 on return correlations<br/>→ Defensive / Value-Cyclical / Growth<br/>Silhouette validation + stability check"]
+        F2["<b>Step 2: Cointegration</b><br/>Engle-Granger ADF test<br/>All within-cluster pairs<br/>→ Keep p-value &lt; 0.05"]
+        F3["<b>Step 3: OU Half-Life</b><br/>Regress Δspread ~ spread_lag<br/>→ Keep HL ≤ 252 days<br/>Select fastest-reverting pair"]
+        F4["<b>Step 4: Kalman Filter</b><br/>Dynamic hedge ratio β_t<br/>Benchmark calibration Q/H from n.ma<br/>→ Stationary spread + rolling z-score"]
+    end
+
+    subgraph SIGNAL["<b>Signal & Execution (8.4)</b>"]
+        S1["Z-Score Signal<br/>Rolling 20-day mean and SD"]
+        S2{"Trade Decision"}
+        S3["Long Spread: Z &lt; −z.entry"]
+        S4["Short Spread: Z &gt; +z.entry"]
+        S5["Exit: return to flat"]
+        S6["Stop-Loss: |Z| &gt; z.stop"]
+        S7["8.4.1 Execution Timing<br/>CC / CO / OC decomposition"]
+    end
+
+    subgraph EVALUATE["<b>Evaluation (8.6 – 8.10)</b>"]
+        E1["8.7 Optimization<br/>Grid search: z.entry × n.ma<br/>RTL::tradeStats per combo"]
+        E1b["8.8.9 3D Surface Plots<br/>Sharpe · CumReturn · DD.Max<br/>Interactive plotly surfaces"]
+        E1c["8.8.9.1 Z-Score Normalization<br/>Standardize all metrics<br/>Composite desirability score"]
+        E1d["8.8.9.2 Plateau Selection<br/>max-min(own, neighbor avg)<br/>Anti-overfit robustness"]
+        E2["8.9 Risk Appetite Filter<br/>Robust params from plateau"]
+        E3["8.8 Risk / Reward<br/>Sharpe · Omega · Drawdown<br/>Correlation to SPY benchmark"]
+        E4["8.10 Out-of-Sample<br/>Apply optimal params to test set<br/>No refitting — walk-forward"]
+    end
+
+    subgraph REFLECT["<b>Reflection</b>"]
+        R1["Literature Flow<br/>Which paper → which step"]
+        R2["Weaknesses<br/>10 limitations ranked by severity"]
+    end
+
+    H1 --> D1 --> D2 --> D3
+    D3 --> F1 --> F2 --> F3 --> F4
+    F4 --> S1 --> S2
+    S2 --> S3 & S4 & S5 & S6
+    S3 & S4 & S5 & S6 --> S7
+    S7 --> E1 --> E1b --> E1c --> E1d --> E2 --> E3 --> E4
+    E4 --> R1 & R2
+```
+
+**Reading the map:** Each box is a stage. Each arrow is a dependency — a later stage cannot run without the earlier stage's output. The filter pipeline progressively narrows: 10 ETFs → 22 candidate pairs → 7 cointegrated → 4 tradeable → 1 primary pair. The evaluation pipeline then stress-tests that pair across parameter combinations and unseen data.
+
+## Data
+
+### ETF Universe
+
+The strategy universe consists of eleven S&P 500 Select Sector SPDR ETFs plus the benchmark (SPY). Two ETFs have limited history and are **excluded from the clustering model**:
+
+- **XLC** (Communication Services) — available from June 2018 only; only ~6.5 years of training data
+- **XLRE** (Real Estate) — available from October 2015 only; only ~9 years of training data
+
+Both are retained in the full data pull for possible use in later pipeline steps.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+#| cache: true
+
+tickers <- c("SPY", "XLB", "XLC", "XLE", "XLF", "XLI",
+             "XLK", "XLP", "XLRE", "XLV", "XLU", "XLY")
+
+df <- tidyquant::tq_get(
+  tickers,
+  get  = "stock.prices",
+  from = "2000-06-01",
+  to   = "2026-03-31"
+)
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+df %>%
+  dplyr::group_by(symbol) %>%
+  dplyr::summarise(
+    `Start Date`     = min(date),
+    `End Date`       = max(date),
+    `Observations`   = dplyr::n(),
+    `Full History`   = dplyr::if_else(
+      min(date) <= as.Date("2001-01-01"), "Yes", "No"
+    ),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(`Full History`, symbol) %>%
+  gt::gt() %>%
+  gt::tab_header(
+    title    = "ETF Universe — Data Coverage",
+    subtitle = "S&P 500 Select Sector SPDR ETFs | Jun 2000 – Mar 2026"
+  ) %>%
+  gt::fmt_date(columns = c(`Start Date`, `End Date`), date_style = "yMd") %>%
+  gt::fmt_number(columns = `Observations`, decimals = 0) %>%
+  gt::tab_style(
+    style     = gt::cell_text(color = "red", weight = "bold"),
+    locations = gt::cells_body(
+      columns = `Full History`,
+      rows    = `Full History` == "No"
+    )
+  ) %>%
+  gt::tab_footnote(
+    footnote  = "XLC and XLRE excluded from clustering due to insufficient training history.",
+    locations = gt::cells_column_labels(columns = `Full History`)
+  )
+```
+
+### Price History
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+df.norm <- df %>%
+  dplyr::group_by(symbol) %>%
+  dplyr::arrange(date) %>%
+  dplyr::mutate(price.idx = 100 * adjusted / dplyr::first(adjusted)) %>%
+  dplyr::ungroup()
+
+p.price <- df.norm %>%
+  ggplot2::ggplot(ggplot2::aes(x = date, y = price.idx, col = symbol)) +
+  ggplot2::geom_line(linewidth = 0.4) +
+  ggplot2::geom_vline(
+    xintercept = as.Date("2025-01-01"),
+    col        = "red",
+    linetype   = "dashed",
+    linewidth  = 0.8
+  ) +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title    = "S&P 500 Sector ETF Price History (Indexed to 100)",
+    subtitle = "Red dashed line = Jan 2025 train/test cutoff",
+    x        = "",
+    y        = "Price Index (Base = 100)",
+    col      = "ETF"
+  )
+
+plotly::ggplotly(p.price)
+```
+
+## Train / Test Split
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+df.train <- df %>% dplyr::filter(date <= as.Date("2024-12-31"))
+df.test  <- df %>% dplyr::filter(date >= as.Date("2025-01-01"))
+
+dplyr::tibble(
+  Set      = c("Training", "Testing"),
+  From     = c("Jun 2000", "Jan 2025"),
+  To       = c("Dec 2024", "Mar 2026"),
+  Months   = c(295L, 15L),
+  Tickers  = c(dplyr::n_distinct(df.train$symbol),
+               dplyr::n_distinct(df.test$symbol)),
+  Rows     = c(nrow(df.train), nrow(df.test))
+) %>%
+  gt::gt() %>%
+  gt::tab_header(
+    title    = "Train / Test Split",
+    subtitle = "All models fit on training data only — test set is held out until final evaluation"
+  ) %>%
+  gt::fmt_number(columns = Rows, decimals = 0)
+```
+
+**Key principle (Module 2):** Entry and exit levels — and all model parameters — must be determined using only information available at the time of trading. The test period (Jan 2025 – Mar 2026) is never seen until final out-of-sample evaluation.
+
+## Log Returns
+
+Daily log returns are computed on `adjusted` prices (corporate-action adjusted). The first observation per ticker is dropped (NA from the lag).
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+etf.ret.train <- df.train %>%
+  dplyr::group_by(symbol) %>%
+  dplyr::mutate(ret = log(adjusted / dplyr::lag(adjusted))) %>%
+  tidyr::drop_na(ret) %>%
+  dplyr::ungroup()
+
+etf.ret.test <- df.test %>%
+  dplyr::group_by(symbol) %>%
+  dplyr::mutate(ret = log(adjusted / dplyr::lag(adjusted))) %>%
+  tidyr::drop_na(ret) %>%
+  dplyr::ungroup()
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+p.ret <- etf.ret.train %>%
+  dplyr::filter(symbol != "SPY") %>%
+  ggplot2::ggplot(ggplot2::aes(x = ret)) +
+  ggplot2::geom_density(fill = "blue", alpha = 0.3, col = "blue") +
+  ggplot2::theme_minimal() +
+  ggplot2::facet_wrap(~ symbol, ncol = 3, scales = "free_y") +
+  ggplot2::labs(
+    title    = "Log Return Distributions — Sector ETFs",
+    subtitle = "Training period: Jun 2000 – Dec 2024 | Daily log returns on adjusted prices",
+    x        = "Log Return",
+    y        = "Density"
+  )
+
+p.ret
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+etf.ret.train %>%
+  dplyr::group_by(symbol) %>%
+  dplyr::summarise(
+    `Ann. Return`  = base::round(base::mean(ret, na.rm = TRUE) * 252, 4),
+    `Ann. Vol`     = base::round(stats::sd(ret, na.rm = TRUE) * base::sqrt(252), 4),
+    `Sharpe`       = base::round((base::mean(ret, na.rm = TRUE) * 252) /
+                       (stats::sd(ret, na.rm = TRUE) * base::sqrt(252)), 3),
+    `Min Return`   = base::round(base::min(ret, na.rm = TRUE), 4),
+    `Max Return`   = base::round(base::max(ret, na.rm = TRUE), 4),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(`Sharpe`)) %>%
+  gt::gt() %>%
+  gt::tab_header(
+    title    = "Return Summary Statistics — Training Period",
+    subtitle = "Annualised return and volatility | Jun 2000 – Dec 2024"
+  ) %>%
+  gt::fmt_number(
+    columns  = c(`Ann. Return`, `Ann. Vol`, `Sharpe`, `Min Return`, `Max Return`),
+    decimals = 4
+  )
+```
+
+## Step 1 — Clustering
+
+Clustering is the **primary signal driver**. It partitions the sector ETF universe by return co-movement similarity, identifying structurally related ETFs eligible for relative-value pair trading. The cluster assignments define which ETFs may be legitimately paired against each other in Step 2.
+
+**Fit on training data only.** Assignments are applied to the test period without refitting — consistent with the tidymodels principle of fit-on-train, evaluate-on-test.
+
+### Data Preparation
+
+XLC and XLRE are excluded. The remaining 10 tickers are pivoted to a wide return matrix and normalised via a `recipes` preprocessing pipeline (equivalent to `base::scale(center = TRUE, scale = TRUE)`). The normalised matrix is then transposed so that rows represent ETFs — the correct orientation for computing ETF-to-ETF distances.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+tickers.cluster <- c("SPY", "XLB", "XLE", "XLF", "XLI",
+                     "XLK", "XLP", "XLV", "XLU", "XLY")
+
+etf.wide.train <- etf.ret.train %>%
+  dplyr::filter(symbol %in% tickers.cluster) %>%
+  tidyr::pivot_wider(
+    id_cols     = date,
+    names_from  = symbol,
+    values_from = ret
+  ) %>%
+  tidyr::drop_na()
+
+# Tidymodels recipe: remove date, normalise all numeric columns
+recipe.cluster <- recipes::recipe(~ ., data = etf.wide.train) %>%
+  recipes::step_rm(date) %>%
+  recipes::step_normalize(recipes::all_numeric()) %>%
+  recipes::prep(training = etf.wide.train)
+
+etf.baked  <- recipes::bake(recipe.cluster, new_data = etf.wide.train)
+etf.scaled <- base::as.matrix(etf.baked)
+
+# Transpose: cluster ETFs (rows), not dates (rows)
+etf.t    <- base::t(etf.scaled)
+dist.mat <- stats::dist(etf.t)
+```
+
+### Elbow Method — Optimal k
+
+Within-cluster sum of squares (WSS) is computed for k = 2 to 8. The elbow point — where adding another cluster yields diminishing reduction in WSS — identifies the optimal k.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+wss <- purrr::map_dbl(2:8, function(k) {
+  km <- stats::kmeans(etf.t, centers = k, nstart = 25)
+  km$tot.withinss
+})
+
+df.elbow <- dplyr::tibble(k = 2:8, wss = wss)
+
+p.elbow <- df.elbow %>%
+  ggplot2::ggplot(ggplot2::aes(x = k, y = wss)) +
+  ggplot2::geom_line(col = "blue") +
+  ggplot2::geom_point(col = "blue", size = 3) +
+  ggplot2::geom_vline(xintercept = 3, col = "red", linetype = "dashed") +
+  ggplot2::scale_x_continuous(breaks = 2:8) +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title    = "Elbow Method — K-Means WSS by Number of Clusters",
+    subtitle = "Red dashed line at k = 3 | Training data only: Jun 2000 – Dec 2024",
+    x        = "Number of Clusters (k)",
+    y        = "Total Within-Cluster SS"
+  )
+
+p.elbow
+```
+
+### K-Means (k = 3)
+
+K-Means is run with `nstart = 25` to avoid local minima. `set.seed(452)` ensures reproducibility. Clusters are labelled by the known sector composition of anchor ETFs: XLU (Defensive), XLE (Value / Cyclical), XLK (Growth). The elbow plot does not show a sharp kink — sector ETFs share dominant systematic market exposure by construction, which structurally limits silhouette separation. k=3 is chosen on economic grounds: the Defensive / Value-Cyclical / Growth taxonomy is the standard sector rotation framework in institutional finance and aligns with Module 3 class materials.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+set.seed(452)
+km.result <- stats::kmeans(etf.t, centers = 3, nstart = 25)
+
+# Label clusters by anchor ETFs
+def.cluster <- km.result$cluster[["XLU"]]
+cyc.cluster <- km.result$cluster[["XLE"]]
+grw.cluster <- km.result$cluster[["XLK"]]
+
+df.clusters <- dplyr::tibble(
+  symbol  = base::names(km.result$cluster),
+  cluster = km.result$cluster
+) %>%
+  dplyr::mutate(
+    cluster.label = dplyr::case_when(
+      cluster == def.cluster ~ "Defensive",
+      cluster == cyc.cluster ~ "Value / Cyclical",
+      cluster == grw.cluster ~ "Growth",
+      TRUE ~ paste0("Cluster ", cluster)
+    ),
+    sector = dplyr::case_when(
+      symbol == "SPY"  ~ "S&P 500 Benchmark",
+      symbol == "XLB"  ~ "Materials",
+      symbol == "XLE"  ~ "Energy",
+      symbol == "XLF"  ~ "Financials",
+      symbol == "XLI"  ~ "Industrials",
+      symbol == "XLK"  ~ "Technology",
+      symbol == "XLP"  ~ "Consumer Staples",
+      symbol == "XLV"  ~ "Health Care",
+      symbol == "XLU"  ~ "Utilities",
+      symbol == "XLY"  ~ "Consumer Discretionary",
+      TRUE ~ symbol
+    )
+  ) %>%
+  dplyr::arrange(cluster.label, symbol)
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+df.clusters %>%
+  dplyr::select(symbol, sector, cluster.label) %>%
+  dplyr::rename(
+    Ticker  = symbol,
+    Sector  = sector,
+    Cluster = cluster.label
+  ) %>%
+  gt::gt() %>%
+  gt::tab_header(
+    title    = "K-Means Cluster Assignments (k = 3)",
+    subtitle = "Fit on training data Jun 2000 – Dec 2024 | Seed = 452"
+  ) %>%
+  gt::tab_row_group(
+    label = "Growth",
+    rows  = Cluster == "Growth"
+  ) %>%
+  gt::tab_row_group(
+    label = "Value / Cyclical",
+    rows  = Cluster == "Value / Cyclical"
+  ) %>%
+  gt::tab_row_group(
+    label = "Defensive",
+    rows  = Cluster == "Defensive"
+  ) %>%
+  gt::tab_footnote(
+    footnote  = "XLC (Communication Services) and XLRE (Real Estate) excluded due to insufficient training history.",
+    locations = gt::cells_title(groups = "subtitle")
+  )
+```
+
+### Hierarchical Clustering — Ward's Method
+
+Hierarchical clustering using Ward's minimum variance linkage (`ward.D2`) provides a cross-validation of the K-Means assignments. The dendrogram visualises the merge sequence and confirms the k = 3 cut is economically natural.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+hc.result <- stats::hclust(dist.mat, method = "ward.D2")
+
+p.dend <- factoextra::fviz_dend(
+  hc.result,
+  k         = 3,
+  rect      = TRUE,
+  rect_fill = TRUE,
+  ggtheme   = ggplot2::theme_minimal(),
+  main      = "Dendrogram — Ward's Method (k = 3)",
+  sub       = "Training period: Jun 2000 – Dec 2024",
+  xlab      = "",
+  ylab      = "Height"
+)
+
+p.dend
+```
+
+### Silhouette Validation
+
+Silhouette scores measure how similar each ETF is to its own cluster versus neighbouring clusters. Scores range from -1 (misclassified) to +1 (perfectly assigned). A mean score above 0.5 indicates strong cluster structure; below 0.3 flags a problem.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+sil     <- cluster::silhouette(km.result$cluster, dist.mat)
+sil.avg <- base::mean(sil[, 3])
+
+p.sil <- factoextra::fviz_silhouette(
+  sil,
+  ggtheme       = ggplot2::theme_minimal(),
+  print.summary = FALSE
+) +
+  ggplot2::labs(
+    title    = paste0(
+      "Silhouette Plot — K-Means (k = 3) | Avg Score = ",
+      base::round(sil.avg, 3)
+    ),
+    subtitle = "Low score expected: sector ETFs share systematic market exposure by construction"
+  )
+
+p.sil
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+dplyr::tibble(
+  Metric = c("Average Silhouette Score", "Cluster Quality"),
+  Value  = c(
+    base::as.character(base::round(sil.avg, 3)),
+    dplyr::case_when(
+      sil.avg >= 0.50 ~ "Strong (>= 0.5) — proceed",
+      sil.avg >= 0.30 ~ "Moderate (0.3 – 0.5) — acceptable",
+      TRUE            ~ "Weak (< 0.3) — revisit k or features"
+    )
+  )
+) %>%
+  gt::gt() %>%
+  gt::tab_header(title = "K-Means Cluster Validation — Silhouette") %>%
+  gt::tab_style(
+    style     = gt::cell_text(color = "red", weight = "bold"),
+    locations = gt::cells_body(
+      columns = Value,
+      rows    = Metric == "Cluster Quality" &
+                grepl("Weak", Value)
+    )
+  ) %>%
+  gt::tab_style(
+    style     = gt::cell_text(color = "blue", weight = "bold"),
+    locations = gt::cells_body(
+      columns = Value,
+      rows    = Metric == "Cluster Quality" &
+                grepl("Strong|Moderate", Value)
+    )
+  )
+```
+
+### Stability Check — Pre vs Post 2020
+
+A regime-robust clustering should not materially change after the COVID shock. The clustering (k=3) is independently refit on pre-2020 and post-2020 subsets of the training data. Stable assignments give confidence that the three-cluster structure reflects durable economic relationships rather than a period-specific artifact.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+# Pre-2020 subset
+etf.wide.pre2020 <- etf.ret.train %>%
+  dplyr::filter(
+    symbol %in% tickers.cluster,
+    date   <  as.Date("2020-01-01")
+  ) %>%
+  tidyr::pivot_wider(
+    id_cols     = date,
+    names_from  = symbol,
+    values_from = ret
+  ) %>%
+  tidyr::drop_na()
+
+recipe.pre2020 <- recipes::recipe(~ ., data = etf.wide.pre2020) %>%
+  recipes::step_rm(date) %>%
+  recipes::step_normalize(recipes::all_numeric()) %>%
+  recipes::prep(training = etf.wide.pre2020)
+
+etf.pre2020 <- base::t(base::as.matrix(
+  recipes::bake(recipe.pre2020, new_data = etf.wide.pre2020)
+))
+
+set.seed(452)
+km.pre2020 <- stats::kmeans(etf.pre2020, centers = 3, nstart = 25)
+
+# Post-2020 subset
+etf.wide.post2020 <- etf.ret.train %>%
+  dplyr::filter(
+    symbol %in% tickers.cluster,
+    date   >= as.Date("2020-01-01")
+  ) %>%
+  tidyr::pivot_wider(
+    id_cols     = date,
+    names_from  = symbol,
+    values_from = ret
+  ) %>%
+  tidyr::drop_na()
+
+recipe.post2020 <- recipes::recipe(~ ., data = etf.wide.post2020) %>%
+  recipes::step_rm(date) %>%
+  recipes::step_normalize(recipes::all_numeric()) %>%
+  recipes::prep(training = etf.wide.post2020)
+
+etf.post2020 <- base::t(base::as.matrix(
+  recipes::bake(recipe.post2020, new_data = etf.wide.post2020)
+))
+
+set.seed(452)
+km.post2020 <- stats::kmeans(etf.post2020, centers = 3, nstart = 25)
+
+# Label using anchor ETFs (3 clusters)
+def.pre  <- km.pre2020$cluster[["XLU"]]
+cyc.pre  <- km.pre2020$cluster[["XLE"]]
+grw.pre  <- km.pre2020$cluster[["XLK"]]
+def.post <- km.post2020$cluster[["XLU"]]
+cyc.post <- km.post2020$cluster[["XLE"]]
+grw.post <- km.post2020$cluster[["XLK"]]
+
+df.stability <- dplyr::tibble(
+  symbol    = base::names(km.pre2020$cluster),
+  pre.2020  = dplyr::case_when(
+    km.pre2020$cluster == def.pre  ~ "Defensive",
+    km.pre2020$cluster == cyc.pre  ~ "Value / Cyclical",
+    km.pre2020$cluster == grw.pre  ~ "Growth",
+    TRUE ~ "Other"
+  ),
+  post.2020 = dplyr::case_when(
+    km.post2020$cluster == def.post  ~ "Defensive",
+    km.post2020$cluster == cyc.post  ~ "Value / Cyclical",
+    km.post2020$cluster == grw.post  ~ "Growth",
+    TRUE ~ "Other"
+  )
+) %>%
+  dplyr::mutate(
+    stable = dplyr::if_else(pre.2020 == post.2020, "Yes", "No")
+  )
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+df.stability %>%
+  dplyr::rename(
+    Ticker      = symbol,
+    `Pre-2020`  = pre.2020,
+    `Post-2020` = post.2020,
+    Stable      = stable
+  ) %>%
+  gt::gt() %>%
+  gt::tab_header(
+    title    = "Cluster Stability — Pre vs Post 2020",
+    subtitle = "Regime robustness check | Stable = same label across both windows"
+  ) %>%
+  gt::tab_style(
+    style     = gt::cell_text(color = "red", weight = "bold"),
+    locations = gt::cells_body(
+      columns = Stable,
+      rows    = Stable == "No"
+    )
+  ) %>%
+  gt::tab_style(
+    style     = gt::cell_text(color = "blue", weight = "bold"),
+    locations = gt::cells_body(
+      columns = Stable,
+      rows    = Stable == "Yes"
+    )
+  ) %>%
+  gt::tab_footnote(
+    footnote  = "Any 'No' row is flagged for manual review before proceeding to cointegration testing.",
+    locations = gt::cells_column_labels(columns = Stable)
+  )
+```
+
+### Interpretation — Clustering
+
+The K-Means algorithm partitions the 10 sector ETFs into three groups based on their daily return co-movement over 24 years. The three clusters map cleanly onto standard sector rotation theory:
+
+- **Defensive** (XLP, XLU): Consumer Staples and Utilities — low-beta, income-oriented sectors that outperform in recessions. These are the "safe haven" ETFs.
+- **Value / Cyclical** (XLE, and possibly XLF): Energy and Financials — sectors driven by commodity cycles and interest rate regimes. Returns are highly volatile and regime-dependent.
+- **Growth** (SPY, XLB, XLI, XLK, XLV, XLY, XLF): The broad market and growth-sensitive sectors. This is the largest cluster because the S&P 500 itself (SPY) is market-cap-weighted toward growth.
+
+The **silhouette score is low** (~0.16). This is expected, not alarming: all 10 ETFs share dominant systematic market exposure (β ≈ 1 to SPY), so inter-cluster boundaries are inherently fuzzy. The clustering serves an **organizational role** — it nominates economically plausible pairs — while cointegration (Step 2) provides the actual statistical validation.
+
+The **stability check** confirms whether the cluster labels are robust to the COVID-19 structural break. ETFs that change cluster between pre-2020 and post-2020 are flagged for review but not automatically excluded.
+
