@@ -37,64 +37,13 @@ library(PerformanceAnalytics)
 library(RTL)
 ```
 
-## Mental Model — How the Strategy Came to Life
+## Mental Model - How the Strategy Came to Life
 
-The strategy answers one question: *"Can two sector ETFs that historically move together be traded profitably when their spread temporarily diverges?"* The answer requires four sequential filters — each one narrows the universe from many candidates to one actionable pair and a concrete trading rule. The diagram below shows the full lifecycle from hypothesis to evaluation.
+The strategy answers one question: *"Can two sector ETFs that historically move together be traded profitably when their spread temporarily diverges?"* The answer requires four sequential filters each one narrows the universe from many candidates to one actionable pair and a concrete trading rule. The diagram below shows the full lifecycle from hypothesis to evaluation.
 
-```{mermaid}
-graph TD
-    subgraph HYPOTHESIS["<b>Hypothesis</b>"]
-        H1["Sector ETFs share systematic risk<br/>→ their spreads should mean-revert"]
-    end
-
-    subgraph DATA["<b>Data Layer</b>"]
-        D1["tidyquant::tq_get<br/>12 SPDR ETFs | Jun 2000 – Mar 2026<br/>Adjusted Close + Open Prices"]
-        D2["Train / Test Split<br/>Train: Jun 2000 – Dec 2024<br/>Test: Jan 2025 – Mar 2026<br/>No information leakage"]
-        D3["Log Returns + Log Prices<br/>Log returns for clustering<br/>Log prices for cointegration & Kalman"]
-    end
-
-    subgraph FILTER["<b>4-Step Filter Pipeline (Train Only)</b>"]
-        F1["<b>Step 1: Clustering</b><br/>K-Means k = 3 on return correlations<br/>→ Defensive / Value-Cyclical / Growth<br/>Silhouette validation + stability check"]
-        F2["<b>Step 2: Cointegration</b><br/>Engle-Granger ADF test<br/>All within-cluster pairs<br/>→ Keep p-value &lt; 0.05"]
-        F3["<b>Step 3: OU Half-Life</b><br/>Regress Δspread ~ spread_lag<br/>→ Keep HL ≤ 252 days<br/>All tradeable pairs selected"]
-        F4["<b>Step 4: Kalman Filter + Portfolio</b><br/>Dynamic hedge ratio β_t per pair<br/>Equal-weight portfolio, monthly rebalancing<br/>→ Portfolio daily return stream"]
-    end
-
-    subgraph SIGNAL["<b>Signal & Execution (8.4)</b>"]
-        S1["Z-Score Signal<br/>Rolling 20-day mean and SD"]
-        S2{"Trade Decision"}
-        S3["Long Spread: Z &lt; −z.entry"]
-        S4["Short Spread: Z &gt; +z.entry"]
-        S5["Exit: return to flat"]
-        S6["Stop-Loss: |Z| &gt; z.stop"]
-        S7["8.4.1 Execution Timing<br/>CC / CO / OC decomposition"]
-    end
-
-    subgraph EVALUATE["<b>Evaluation (8.6 – 8.10)</b>"]
-        E1["8.7 Optimization<br/>Grid search: z.entry × n.ma<br/>RTL::tradeStats per combo"]
-        E1b["8.8.9 3D Surface Plots<br/>Sharpe · CumReturn · DD.Max<br/>Interactive plotly surfaces"]
-        E1c["8.8.9.1 Z-Score Normalization<br/>Standardize all metrics<br/>Composite desirability score"]
-        E1d["8.8.9.2 Plateau Selection<br/>max-min(own, neighbor avg)<br/>Anti-overfit robustness"]
-        E2["8.9 Risk Appetite Filter<br/>Robust params from plateau"]
-        E3["8.8 Risk / Reward<br/>Sharpe · Omega · Drawdown<br/>Correlation to SPY benchmark"]
-        E4["8.10 Out-of-Sample<br/>Apply optimal params to test set<br/>No refitting — walk-forward"]
-    end
-
-    subgraph REFLECT["<b>Reflection</b>"]
-        R1["Literature Flow<br/>Which paper → which step"]
-        R2["Weaknesses<br/>10 limitations ranked by severity"]
-    end
-
-    H1 --> D1 --> D2 --> D3
-    D3 --> F1 --> F2 --> F3 --> F4
-    F4 --> S1 --> S2
-    S2 --> S3 & S4 & S5 & S6
-    S3 & S4 & S5 & S6 --> S7
-    S7 --> E1 --> E1b --> E1c --> E1d --> E2 --> E3 --> E4
-    E4 --> R1 & R2
+```{=html}
+<iframe src="qtmm.pdf" width="100%" height="750px" style="border:1px solid #ddd;border-radius:6px;"></iframe>
 ```
-
-**Reading the map:** Each box is a stage. Each arrow is a dependency — a later stage cannot run without the earlier stage's output. The filter pipeline progressively narrows: 10 ETFs → 22 candidate pairs → cointegrated survivors → tradeable pairs. All tradeable pairs are then run simultaneously as an equal-weight portfolio with monthly rebalancing, and that portfolio is stress-tested across parameter combinations and unseen data.
 
 ## Data
 
@@ -665,7 +614,7 @@ tickerA <- pairs.tradeable$symbolA[1]
 tickerB <- pairs.tradeable$symbolB[1]
 ```
 
-All `r nrow(pairs.tradeable)` tradeable pairs proceed to the strategy layer and are traded simultaneously with equal weight allocation, rebalanced to equal weight at the end of each calendar month. The fastest-reverting pair is **`r tickerA` / `r tickerB`**, which serves as the reference pair for execution timing diagnostics in Step 4.
+All `r nrow(pairs.tradeable)` tradeable pairs proceed to the strategy layer and are traded simultaneously with equal weight allocation, rebalanced to equal weight at the end of each calendar month.
 
 ### Half-Life Results
 
@@ -1640,25 +1589,25 @@ result.test %>%
 
 **What the numbers say:**
 
--   **Train Sharpe 0.71, Test Sharpe 0.60:** The strategy earns positive risk-adjusted returns out of sample. The degradation is modest, not a collapse, which is the best realistic outcome in quantitative trading.
+-   **Train Sharpe 0.5336, Test Sharpe 0.2145:** The strategy retains a positive risk-adjusted return out of sample. The drop is meaningful but not a collapse — a Sharpe above zero on unseen data from a market-neutral strategy with no directional exposure is a realistic outcome, not a failure.
 
--   **Train CumReturn 2.41, Test CumReturn 0.05:** This comparison is misleading on its face. Train covers 24 years; test covers 15 months. The test window produced approximately 4.5% gross return in 15 months from a market-neutral strategy with no directional exposure, which is consistent with an annualized return of 3.7%.
+-   **Train CumReturn 1.6197, Test CumReturn 0.0124:** This comparison is misleading on its face. Train covers 24 years; test covers 15 months. The test window produced approximately 1.24% gross return in 15 months, consistent with an annualized return of 1.00% (Ret.Ann = 0.0100). The lower absolute return reflects a genuinely difficult macro regime, not broken signal logic.
 
--   **Train vs Test DD.Max:** The test drawdown of 4.25% is shallower than the train drawdown of 8.98%, but this is partly a time artifact. Fifteen months provides fewer opportunities for a large drawdown to develop. The equity curve confirms the portfolio recovered cleanly after the mid-2025 dip, which is the behavioural signature of genuine mean reversion.
+-   **Train DD.Max −19.52%, Test DD.Max −3.44%:** The test drawdown is far shallower than train. This is partly a time artifact — 15 months provides fewer opportunities for a deep drawdown to accumulate — but the equity curve confirms the portfolio recovered cleanly after the mid-2025 dip, which is the behavioural signature of genuine mean reversion.
 
--   **Win rate and time-in-market are stable:** %.Win and %.InMrkt are nearly identical across train and test. The signal generation logic is consistent, not a product of overfitting to a specific training regime.
+-   **Win rate and time-in-market are stable:** %.Win (0.5106 vs 0.4619) and %.InMrkt (0.6611 vs 0.6355) are close across train and test. The signal generation logic is consistent; it is not triggering or closing trades in a structurally different pattern on unseen data.
 
 **Why some degradation occurs:**
 
--   **Regime change:** The cointegration relationships were estimated on 24 years of data. The 2025-2026 period introduced tariff shocks, rate cuts, and sector rotation that may shift spread dynamics across multiple pairs simultaneously.
+-   **Regime change:** The cointegration relationships were estimated on 24 years of data. The 2025–2026 period introduced tariff shocks, rate cuts, and sector rotation that may shift spread dynamics across multiple pairs simultaneously.
 
--   **Slow reversion:** Sector ETF pairs mean-revert on timescales measured in months. Fifteen months of test data contains very few complete half-life cycles per pair, too few to distinguish a genuine edge from noise with statistical confidence.
+-   **Slow reversion:** Sector ETF pairs mean-revert on timescales measured in months. Fifteen months of test data contains very few complete half-life cycles per pair — too few to distinguish a genuine edge from noise with statistical confidence.
 
 -   **Parameter fit:** Even with walk-forward discipline and plateau selection, the optimal parameters were identified on a 24-year training regime. Some of that fit will not transfer perfectly to a regime the optimizer never saw.
 
 **What this means for the strategy:**
 
-The out-of-sample result does not invalidate the strategy. A Sharpe of 0.60 and an annualized return of 3.7% with a max drawdown under 5% is a commercially viable outcome for a market-neutral strategy. The multi-pair portfolio structure reduces the single-pair concentration risk present in simpler implementations, and the equity curve shows the portfolio ending the test period above its starting value despite a difficult macro environment. A definitive verdict requires 3 to 5 years of out-of-sample data covering multiple complete business cycles, but the 15-month result provides no evidence that the strategy edge has broken down.
+The out-of-sample result does not invalidate the strategy. An annualized return of 1.00%, Sharpe of 0.2145, and max drawdown of 3.44% is a subdued but structurally intact result for a market-neutral strategy operating through one of the more volatile macro periods in recent history. The multi-pair portfolio structure limits single-pair concentration risk, and the equity curve ends the test period above its starting value. A definitive verdict requires 3 to 5 years of out-of-sample data covering multiple complete business cycles, but the 15-month result provides no evidence that the strategy edge has broken down.
 
 ------------------------------------------------------------------------
 
@@ -1770,9 +1719,8 @@ No backtested strategy should be presented without an honest assessment of what 
 #| message: false
 
 dplyr::tibble(
-  `#` = 1:10,
+  `#` = 1:9,
   Weakness = c(
-    "Single-pair concentration (addressed)",
     "Slow mean-reversion",
     "No transaction costs",
     "Weak cluster separation",
@@ -1784,20 +1732,19 @@ dplyr::tibble(
     "Short out-of-sample window"
   ),
   Severity = c(
-    "Low", "High", "Medium", "Medium", "Medium",
+    "High", "Medium", "Medium", "Medium",
     "Medium", "Low", "Low", "Low", "Low"
   ),
   Description = c(
-    "Addressed: all tradeable pairs are traded simultaneously with equal weight and monthly rebalancing. If one pair weakens, the others continue contributing. Residual risk is that all pairs could weaken simultaneously in an extreme regime shift.",
-    "Sector ETF pairs mean-revert on timescales measured in months. The strategy generates very few round-trip trades per year per pair. In the 15-month test window there may be only 2 to 4 complete cycles across the portfolio — far too few for statistical confidence. The strategy is structurally underpowered for short evaluation horizons.",
-    "Bid/ask spreads, commissions, and slippage are not modeled. Sector ETFs have tight spreads (~0.01–0.02%), so the impact is small for low-frequency trading, but it is non-zero and compounds over 24 years of training data.",
-    "The K-Means silhouette score (~0.16) is well below the 0.5 'strong' threshold. All 10 ETFs share dominant systematic exposure to SPY, making cluster boundaries inherently fuzzy. Clustering serves an organizational role, not a statistical one — cointegration is the true filter.",
-    "The 120-point parameter grid was optimized on 24 years of training data. Even with the plateau robustness method, there is no guarantee that the selected parameters generalize to future regimes. The composite Z-score mitigates but does not eliminate this risk.",
-    "Ten sector ETFs drawn from one index (S&P 500) offer limited diversity. All sectors are U.S. large-cap, making the universe structurally correlated. A broader universe (international ETFs, factor ETFs, commodities) would provide more independent pair candidates.",
-    "A single 80/20 train/test split at Jan 2025 does not test performance across multiple regimes. Rolling-window or expanding-window walk-forward validation would be more rigorous but computationally expensive for this assignment scope.",
-    "The Kalman filter adapts the hedge ratio continuously, but the strategy has no explicit mechanism to detect when the cointegration relationship has structurally broken. A regime-switching model (Markov, CUSUM) could flag breakdown periods.",
-    "The train/test split date is known a priori. While no test-period information leaks into model fitting, the choice of split date is itself a decision that could be optimized. This is a subtle form of look-ahead.",
-    "Fifteen months (Jan 2025 – Mar 2026) contains ~3 half-life cycles at best. Any conclusion about out-of-sample performance — positive or negative — has very wide confidence intervals."
+    "Sector ETF pairs revert over months, producing very few round trips per year. The 15-month test window likely contains only 2 to 4 complete cycles, which is too few for statistical confidence.",
+    "Bid/ask spreads, commissions, and slippage are not modeled. Impact is small for low-frequency trading given tight ETF spreads, but it is non-zero and compounds over time.",
+    "Silhouette score of 0.16 is well below the 0.5 threshold. All ETFs share heavy SPY exposure, making clean separation impossible. Clustering is organizational; cointegration is the true filter.",
+    "A 120-point grid optimized on 24 years of data carries overfitting risk. The plateau method mitigates but does not eliminate the chance that selected parameters fail in future regimes.",
+    "Ten U.S. large-cap sectors from one index are structurally correlated. A broader universe of international ETFs, factor ETFs, or commodities would yield more independent pair candidates.",
+    "A single train/test split does not test across multiple regimes. Rolling or expanding window walk-forward validation would be more rigorous but was outside the scope of this assignment.",
+    "The Kalman filter adapts the hedge ratio but cannot detect when cointegration has structurally broken. A regime-switching model such as Markov or CUSUM could flag breakdown periods.",
+    "The split date is chosen a priori. While no test-period data leaks into model fitting, the split date choice itself could be optimized, which is a subtle form of look-ahead.",
+    "Fifteen months contains roughly 3 half-life cycles at best. Any conclusion about out-of-sample performance, positive or negative, carries very wide confidence intervals."
   )
 ) %>%
   gt::gt() %>%
@@ -1827,12 +1774,14 @@ dplyr::tibble(
 
 This project implements the full quantitative pairs trading workflow: starting from the hypothesis that sector ETFs share systematic risk factors that create exploitable mean-reverting spreads, then filtering the universe through a disciplined four-step pipeline (K-Means Clustering, Engle-Granger Cointegration, Ornstein-Uhlenbeck Half-Life, and Kalman-Filtered Dynamic Hedging) to identify tradeable pairs with statistically validated mean-reversion properties.
 
-Rather than betting on a single pair, the strategy trades all surviving pairs simultaneously in an equal-weight portfolio with monthly rebalancing. This design choice directly addresses the most dangerous weakness in traditional pairs trading: single-pair concentration risk. When one pair's spread diverges permanently, the other pairs continue generating returns, and the monthly rebalancing prevents any one pair from dominating portfolio exposure.
-
-The parameter selection process goes beyond naive in-sample optimization. The 3D Sharpe surface (8.9) revealed that strategy performance is not a single peak but a broad plateau across a range of z.entry and n.ma combinations. The plateau robustness method (8.9.2) selects parameters from the centre of this stable region rather than the fragile maximum, producing parameters that are more likely to survive regime change.
-
-Out of sample, the strategy delivered a Sharpe ratio of 0.60 and an annualized return of 3.7% with a maximum drawdown under 5% over the January 2025 to March 2026 test period. These results represent modest but real degradation from the training period, which is the expected outcome for any honestly evaluated quantitative strategy. The 15-month test window is too short to deliver a definitive verdict on a slow mean-reversion strategy, but the results show no evidence of structural breakdown.
+**Out of sample, the strategy delivered a Sharpe ratio of 0.21 and an annualized return of 1.0% with a maximum drawdown of 3.4% over the January 2025 to March 2026 test period.** Performance degraded meaningfully from the training period, reflecting a difficult macro environment of tariff shocks, rate cuts, and sector rotation that the optimizer never observed. That said, the strategy remained profitable, market-neutral, and structurally intact — win rate and time-in-market were stable, and the equity curve ended above its starting value. The 15-month test window is too short to deliver a definitive verdict on a slow mean-reversion strategy, but the results provide no evidence that the edge has broken down.
 
 ------------------------------------------------------------------------
 
-## Lessons Learned
+## Things to Improve on
+
+I intend to continue this project in the summer as this is super interesting!!
+
+-   Asset classes: Instead of just operating on ETF that has a lot eyes watching it, I would love to try this strategy on less inefficient commodities, as I think there are more justification to pairs trade than an arbitrary regression! Even if I want to stick with Equities, I will try to test it on individual stocks
+
+-   Clustering: Instead of clustering based only on Log Returns, I would love to find a way to make a composite factor through PCA that integrates idiosyncratic and sentiment                                                                                                                                            
