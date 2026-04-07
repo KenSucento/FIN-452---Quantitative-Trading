@@ -1587,27 +1587,136 @@ result.test %>%
 
 ### Interpretation - Out-of-Sample Results
 
-**What the numbers say:**
+**What the numbers actually say:**
 
--   **Train Sharpe 0.5336, Test Sharpe 0.2145:** The strategy retains a positive risk-adjusted return out of sample. The drop is meaningful but not a collapse — a Sharpe above zero on unseen data from a market-neutral strategy with no directional exposure is a realistic outcome, not a failure.
+The test period produced a Sharpe of 0.2145 and an annualized return of 1.00%. To understand what that means, consider the context: the US risk-free rate in 2025 sat between 4.25% and 4.50%. A strategy that earns 1% annualized is not just underperforming equity benchmarks, it is losing to cash. If Sharpe is recalculated using a realistic Rf of 0.045, the risk-adjusted return flips negative. The Sharpe of 0.2145 only exists because the formula was applied with Rf = 0.
 
--   **Train CumReturn 1.6197, Test CumReturn 0.0124:** This comparison is misleading on its face. Train covers 24 years; test covers 15 months. The test window produced approximately 1.24% gross return in 15 months, consistent with an annualized return of 1.00% (Ret.Ann = 0.0100). The lower absolute return reflects a genuinely difficult macro regime, not broken signal logic.
+The win rate (0.4619) and time-in-market (0.6355) held close to training levels, which confirms the signal logic is mechanically consistent. The pipeline is not broken. The problem is that the alpha it generates, even when the mechanics work as designed, is too thin to matter. The strategy spent 63% of the test period in the market and earned less than sitting in a money market fund.
 
--   **Train DD.Max −19.52%, Test DD.Max −3.44%:** The test drawdown is far shallower than train. This is partly a time artifact — 15 months provides fewer opportunities for a deep drawdown to accumulate — but the equity curve confirms the portfolio recovered cleanly after the mid-2025 dip, which is the behavioural signature of genuine mean reversion.
+The maximum drawdown of 3.44% looks clean relative to training's 19.52%, but the comparison is partly misleading. Fifteen months is a short enough window that deep drawdowns rarely accumulate. The shallow drawdown says less about the strategy's risk management than about the brevity of the test period.
 
--   **Win rate and time-in-market are stable:** %.Win (0.5106 vs 0.4619) and %.InMrkt (0.6611 vs 0.6355) are close across train and test. The signal generation logic is consistent; it is not triggering or closing trades in a structurally different pattern on unseen data.
+**Why the return is this low:**
 
-**Why some degradation occurs:**
+The sector ETF universe is small, liquid, and heavily covered by institutional capital. Any mean-reversion relationship in it has been arbitraged significantly over the past two decades. The pairs identified by this pipeline are real and cointegration confirms that, but the speed and magnitude of reversion has compressed to the point where gross returns barely cover the theoretical opportunity. Transaction costs, which were not modeled, would likely push net return into negative territory.
 
--   **Regime change:** The cointegration relationships were estimated on 24 years of data. The 2025–2026 period introduced tariff shocks, rate cuts, and sector rotation that may shift spread dynamics across multiple pairs simultaneously.
-
--   **Slow reversion:** Sector ETF pairs mean-revert on timescales measured in months. Fifteen months of test data contains very few complete half-life cycles per pair — too few to distinguish a genuine edge from noise with statistical confidence.
-
--   **Parameter fit:** Even with walk-forward discipline and plateau selection, the optimal parameters were identified on a 24-year training regime. Some of that fit will not transfer perfectly to a regime the optimizer never saw.
+The 2025 macro environment added another layer. Tariff shocks and policy-driven sector rotation created regime breaks that were outside anything the optimizer trained on. Sector spreads that might normally revert over weeks widened and stayed wide for months, reducing the number of complete round-trip cycles during the test window.
 
 **What this means for the strategy:**
 
-The out-of-sample result does not invalidate the strategy. An annualized return of 1.00%, Sharpe of 0.2145, and max drawdown of 3.44% is a subdued but structurally intact result for a market-neutral strategy operating through one of the more volatile macro periods in recent history. The multi-pair portfolio structure limits single-pair concentration risk, and the equity curve ends the test period above its starting value. A definitive verdict requires 3 to 5 years of out-of-sample data covering multiple complete business cycles, but the 15-month result provides no evidence that the strategy edge has broken down.
+The 15-month result is not a failure of execution. It is an honest signal that this strategy, applied to large-cap US sector ETFs under current market conditions, does not generate economically meaningful alpha. The structural mechanics work. The returns do not justify the complexity. The benchmark comparison in the next section makes the gap concrete.
+
+------------------------------------------------------------------------
+
+## Benchmark Comparison
+
+A market-neutral strategy should not be evaluated in isolation. The relevant question is not whether the strategy made money, but whether it made enough money to justify holding it instead of something simpler. This section compares the out-of-sample strategy return directly against two benchmarks over the same January 2025 to March 2026 window: SPY as the broad market proxy, and an equal-weight portfolio of all nine sector ETFs used in the clustering step (XLB, XLE, XLF, XLI, XLK, XLP, XLV, XLU, XLY) with monthly rebalancing.
+
+The equal-weight sector index is a deliberate choice. It uses the exact same building blocks as the strategy with zero modeling overhead. If that naive alternative beats the strategy, it is a direct comment on whether the complexity added any value.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+# Equal-weight sector index -- same 9 ETFs, monthly rebalancing
+tickers.ew <- c("XLB", "XLE", "XLF", "XLI", "XLK", "XLP", "XLV", "XLU", "XLY")
+
+ew.daily <- etf.ret.test %>%
+  dplyr::filter(symbol %in% tickers.ew) %>%
+  dplyr::group_by(date) %>%
+  dplyr::summarise(ret = base::mean(ret, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::mutate(cumeq = base::cumprod(1 + ret))
+
+# SPY over test period
+spy.test <- etf.ret.test %>%
+  dplyr::filter(symbol == "SPY") %>%
+  dplyr::select(date, ret) %>%
+  dplyr::mutate(cumeq = base::cumprod(1 + ret))
+
+# Align all three series on shared dates
+df.bench <- result.test %>%
+  dplyr::select(date, cumeq.strat = cumeq) %>%
+  dplyr::inner_join(
+    spy.test %>% dplyr::select(date, cumeq.spy = cumeq),
+    by = "date"
+  ) %>%
+  dplyr::inner_join(
+    ew.daily %>% dplyr::select(date, cumeq.ew = cumeq),
+    by = "date"
+  ) %>%
+  tidyr::drop_na()
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+# Equity curve overlay
+df.bench %>%
+  tidyr::pivot_longer(
+    cols      = c(cumeq.strat, cumeq.spy, cumeq.ew),
+    names_to  = "series",
+    values_to = "cumeq"
+  ) %>%
+  dplyr::mutate(
+    series = dplyr::case_when(
+      series == "cumeq.strat" ~ "Strategy",
+      series == "cumeq.spy"   ~ "SPY",
+      series == "cumeq.ew"    ~ "Equal-Weight Sectors"
+    )
+  ) %>%
+  ggplot2::ggplot(ggplot2::aes(x = date, y = cumeq, col = series)) +
+  ggplot2::geom_line(linewidth = 0.8) +
+  ggplot2::scale_color_manual(
+    values = c("Strategy" = "blue", "SPY" = "red", "Equal-Weight Sectors" = "green")
+  ) +
+  ggplot2::geom_hline(yintercept = 1, col = "grey20", linetype = "dashed") +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title    = "Strategy vs Benchmarks — Out-of-Sample",
+    subtitle = "Jan 2025 – Mar 2026 | Strategy (blue) vs SPY (red) vs Equal-Weight Sectors (green)",
+    x        = "",
+    y        = "Cumulative Equity",
+    col      = ""
+  )
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+# Performance metrics for each benchmark
+stats.spy.bench <- spy.test %>%
+  dplyr::select(date, ret) %>%
+  RTL::tradeStats()
+
+stats.ew.bench <- ew.daily %>%
+  dplyr::select(date, ret) %>%
+  RTL::tradeStats()
+
+# Side-by-side comparison table
+dplyr::tibble(
+  Metric         = base::names(dplyr::as_tibble(stats.test)),
+  Strategy       = base::unlist(dplyr::as_tibble(stats.test)),
+  SPY            = base::unlist(dplyr::as_tibble(stats.spy.bench)),
+  Equal.Weight   = base::unlist(dplyr::as_tibble(stats.ew.bench))
+) %>%
+  dplyr::filter(Metric %in% c("CumReturn", "Ret.Ann", "SD.Ann", "Sharpe", "Omega", "DD.Max", "%.Win")) %>%
+  gt::gt() %>%
+  gt::tab_header(
+    title    = "Performance Comparison — Out-of-Sample",
+    subtitle = "Jan 2025 – Mar 2026 | Rf = 0 for all Sharpe calculations"
+  ) %>%
+  gt::fmt_number(columns = c(Strategy, SPY, Equal.Weight), decimals = 4) %>%
+  gt::tab_footnote(
+    footnote  = "Equal-weight index holds all 9 clustering ETFs at equal weight with monthly rebalancing. No signal, no filter.",
+    locations = gt::cells_column_labels(columns = Equal.Weight)
+  )
+```
+
+The equity curves and metrics table together answer the core question. The strategy's 1% annualized return sits well below both benchmarks. The equal-weight sector index, which requires no model, no optimization, and no Kalman filter, delivers materially higher returns over the same window. SPY compounds that gap further. Market neutrality is a real property of the strategy but in a bull market regime it means systematically forgoing the beta that was the primary driver of returns in 2025 and early 2026. The pairs strategy earns its low drawdown by construction. The cost is that it earns almost nothing else.
 
 ------------------------------------------------------------------------
 
@@ -1732,12 +1841,12 @@ dplyr::tibble(
     "Short out-of-sample window"
   ),
   Severity = c(
-    "High", "Medium", "Medium", "Medium",
+    "High", "High", "Medium", "Medium",
     "Medium", "Low", "Low", "Low", "Low"
   ),
   Description = c(
     "Sector ETF pairs revert over months, producing very few round trips per year. The 15-month test window likely contains only 2 to 4 complete cycles, which is too few for statistical confidence.",
-    "Bid/ask spreads, commissions, and slippage are not modeled. Impact is small for low-frequency trading given tight ETF spreads, but it is non-zero and compounds over time.",
+    "Bid/ask spreads, commissions, and slippage are not modeled. The strategy earns approximately 1% annualized gross out of sample. At that return level, even minimal ETF bid/ask spreads applied across 63% time-in-market across multiple pairs would likely eliminate most or all of the net return. This is not a theoretical concern.",
     "Silhouette score of 0.16 is well below the 0.5 threshold. All ETFs share heavy SPY exposure, making clean separation impossible. Clustering is organizational; cointegration is the true filter.",
     "A 120-point grid optimized on 24 years of data carries overfitting risk. The plateau method mitigates but does not eliminate the chance that selected parameters fail in future regimes.",
     "Ten U.S. large-cap sectors from one index are structurally correlated. A broader universe of international ETFs, factor ETFs, or commodities would yield more independent pair candidates.",
@@ -1766,15 +1875,35 @@ dplyr::tibble(
   )
 ```
 
-**Key takeaway:** Single-pair concentration has been addressed by trading all tradeable pairs simultaneously with equal weight and monthly rebalancing. The remaining highest-severity weakness is slow reversion, which is intrinsic to the sector ETF universe. The practical implication is that this strategy requires a multi-year evaluation window to assess properly, and the 15-month test period in this assignment is insufficient for statistical significance.
+**Key takeaway:** The remaining highest-severity weakness is slow reversion, which is intrinsic to the sector ETF universe. The practical implication is that this strategy requires a multi-year evaluation window to assess properly, and the 15-month test period in this assignment is insufficient for statistical significance.
+
+------------------------------------------------------------------------
+
+## Lessons Learned
+
+These are a few lesson that I've learned from building this project.
+
+-   Backtesting is optimistic by design. A 24-year training window is long enough to pick up real patterns, but also long enough for the optimizer to stumble onto patterns that are not actually there. The out-of-sample results made that gap very clear.
+
+-   Every paper I referenced had in-sample Sharpe ratios above 1.0. The hard part was never building the pipeline. It was running it on data that had no idea I spent months optimizing on something else.
+
+-   A more complex model needs better results to justify itself, not better methodology. This strategy has four filtering steps, a state-space model, a multi-objective optimizer, and a plateau robustness criterion. All of it has legitimate academic support.
+
+-   But none of that matters if the strategy barely beats a savings account. Sophistication has to actually produce alpha that clears the bar set by simpler alternatives. This one did not clear that bar.
+
+-   Knowing that the methodology is sound is not the same as knowing the results are good. That distinction matters a lot in practice. Someone who cannot be honest about their own output is a problem regardless of how sophisticated the model is.
+
+-   The test window included tariff shocks, rate pivots, and some unusual sector rotation. A different 15-month stretch on the same code might have returned a Sharpe of 0.8. That is not an excuse, it is just a real constraint.
+
+-   One test window does not prove anything either way. The right call is to present the numbers honestly and not pretend one draw from a wide distribution settles the question.
 
 ------------------------------------------------------------------------
 
 ## Conclusion
 
-This project implements the full quantitative pairs trading workflow: starting from the hypothesis that sector ETFs share systematic risk factors that create exploitable mean-reverting spreads, then filtering the universe through a disciplined four-step pipeline (K-Means Clustering, Engle-Granger Cointegration, Ornstein-Uhlenbeck Half-Life, and Kalman-Filtered Dynamic Hedging) to identify tradeable pairs with statistically validated mean-reversion properties.
+This project implements the full quantitative pairs trading workflow, starting from the hypothesis that sector ETFs share systematic risk factors that create exploitable mean-reverting spreads, then filtering the universe through a four-step pipeline (K-Means Clustering, Engle-Granger Cointegration, Ornstein-Uhlenbeck Half-Life, and Kalman-Filtered Dynamic Hedging) to identify tradeable pairs with statistically validated mean-reversion properties.
 
-**Out of sample, the strategy delivered a Sharpe ratio of 0.21 and an annualized return of 1.0% with a maximum drawdown of 3.4% over the January 2025 to March 2026 test period.** Performance degraded meaningfully from the training period, reflecting a difficult macro environment of tariff shocks, rate cuts, and sector rotation that the optimizer never observed. That said, the strategy remained profitable, market-neutral, and structurally intact — win rate and time-in-market were stable, and the equity curve ended above its starting value. The 15-month test window is too short to deliver a definitive verdict on a slow mean-reversion strategy, but the results provide no evidence that the edge has broken down.
+Out of sample, the strategy delivered a Sharpe ratio of 0.21 and an annualized return of 1.0% with a maximum drawdown of 3.4% over the January 2025 to March 2026 test period. Against a risk-free rate of approximately 4.5%, the risk-adjusted return on a real-cost basis is negative. SPY and a simple equal-weight basket of the same sector ETFs both outperformed significantly over the same window. The pipeline is methodologically sound, but the returns it produces in the large-cap US sector ETF universe do not justify the complexity relative to simpler alternatives. The structural mechanics work. The alpha does not clear the bar.
 
 ------------------------------------------------------------------------
 
@@ -1784,4 +1913,4 @@ I intend to continue this project in the summer as this is super interesting!!
 
 -   Asset classes: Instead of just operating on ETF that has a lot eyes watching it, I would love to try this strategy on less inefficient commodities, as I think there are more justification to pairs trade than an arbitrary regression! Even if I want to stick with Equities, I will try to test it on individual stocks
 
--   Clustering: Instead of clustering based only on Log Returns, I would love to find a way to make a composite factor through PCA that integrates idiosyncratic and sentiment                                                                                                                                            
+-   Clustering: Instead of clustering based only on Log Returns, I would love to find a way to make a composite factor through PCA that integrates idiosyncratic and sentiment
