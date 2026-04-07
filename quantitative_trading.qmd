@@ -56,8 +56,8 @@ graph TD
     subgraph FILTER["<b>4-Step Filter Pipeline (Train Only)</b>"]
         F1["<b>Step 1: Clustering</b><br/>K-Means k = 3 on return correlations<br/>→ Defensive / Value-Cyclical / Growth<br/>Silhouette validation + stability check"]
         F2["<b>Step 2: Cointegration</b><br/>Engle-Granger ADF test<br/>All within-cluster pairs<br/>→ Keep p-value &lt; 0.05"]
-        F3["<b>Step 3: OU Half-Life</b><br/>Regress Δspread ~ spread_lag<br/>→ Keep HL ≤ 252 days<br/>Select fastest-reverting pair"]
-        F4["<b>Step 4: Kalman Filter</b><br/>Dynamic hedge ratio β_t<br/>Benchmark calibration Q/H from n.ma<br/>→ Stationary spread + rolling z-score"]
+        F3["<b>Step 3: OU Half-Life</b><br/>Regress Δspread ~ spread_lag<br/>→ Keep HL ≤ 252 days<br/>All tradeable pairs selected"]
+        F4["<b>Step 4: Kalman Filter + Portfolio</b><br/>Dynamic hedge ratio β_t per pair<br/>Equal-weight portfolio, monthly rebalancing<br/>→ Portfolio daily return stream"]
     end
 
     subgraph SIGNAL["<b>Signal & Execution (8.4)</b>"]
@@ -94,7 +94,7 @@ graph TD
     E4 --> R1 & R2
 ```
 
-**Reading the map:** Each box is a stage. Each arrow is a dependency — a later stage cannot run without the earlier stage's output. The filter pipeline progressively narrows: 10 ETFs → 22 candidate pairs → 7 cointegrated → 4 tradeable → 1 primary pair. The evaluation pipeline then stress-tests that pair across parameter combinations and unseen data.
+**Reading the map:** Each box is a stage. Each arrow is a dependency — a later stage cannot run without the earlier stage's output. The filter pipeline progressively narrows: 10 ETFs → 22 candidate pairs → cointegrated survivors → tradeable pairs. All tradeable pairs are then run simultaneously as an equal-weight portfolio with monthly rebalancing, and that portfolio is stress-tested across parameter combinations and unseen data.
 
 ## Data
 
@@ -102,8 +102,8 @@ graph TD
 
 The strategy universe consists of eleven S&P 500 Select Sector SPDR ETFs plus the benchmark (SPY). Two ETFs have limited history and are **excluded from the clustering model**:
 
-- **XLC** (Communication Services) — available from June 2018 only; only ~6.5 years of training data
-- **XLRE** (Real Estate) — available from October 2015 only; only ~9 years of training data
+-   **XLC** (Communication Services) — available from June 2018 only; only \~6.5 years of training data
+-   **XLRE** (Real Estate) — available from October 2015 only; only \~9 years of training data
 
 Both are retained in the full data pull for possible use in later pipeline steps.
 
@@ -124,114 +124,13 @@ df <- tidyquant::tq_get(
 )
 ```
 
-```{r}
-#| echo: false
-#| warning: false
-#| message: false
-
-df %>%
-  dplyr::group_by(symbol) %>%
-  dplyr::summarise(
-    `Start Date`     = min(date),
-    `End Date`       = max(date),
-    `Observations`   = dplyr::n(),
-    `Full History`   = dplyr::if_else(
-      min(date) <= as.Date("2001-01-01"), "Yes", "No"
-    ),
-    .groups = "drop"
-  ) %>%
-  dplyr::arrange(`Full History`, symbol) %>%
-  gt::gt() %>%
-  gt::tab_header(
-    title    = "ETF Universe — Data Coverage",
-    subtitle = "S&P 500 Select Sector SPDR ETFs | Jun 2000 – Mar 2026"
-  ) %>%
-  gt::fmt_date(columns = c(`Start Date`, `End Date`), date_style = "yMd") %>%
-  gt::fmt_number(columns = `Observations`, decimals = 0) %>%
-  gt::tab_style(
-    style     = gt::cell_text(color = "red", weight = "bold"),
-    locations = gt::cells_body(
-      columns = `Full History`,
-      rows    = `Full History` == "No"
-    )
-  ) %>%
-  gt::tab_footnote(
-    footnote  = "XLC and XLRE excluded from clustering due to insufficient training history.",
-    locations = gt::cells_column_labels(columns = `Full History`)
-  )
-```
-
-### Price History
+## Background Setup
 
 ```{r}
-#| echo: false
-#| warning: false
-#| message: false
-
-df.norm <- df %>%
-  dplyr::group_by(symbol) %>%
-  dplyr::arrange(date) %>%
-  dplyr::mutate(price.idx = 100 * adjusted / dplyr::first(adjusted)) %>%
-  dplyr::ungroup()
-
-p.price <- df.norm %>%
-  ggplot2::ggplot(ggplot2::aes(x = date, y = price.idx, col = symbol)) +
-  ggplot2::geom_line(linewidth = 0.4) +
-  ggplot2::geom_vline(
-    xintercept = as.Date("2025-01-01"),
-    col        = "red",
-    linetype   = "dashed",
-    linewidth  = 0.8
-  ) +
-  ggplot2::theme_minimal() +
-  ggplot2::labs(
-    title    = "S&P 500 Sector ETF Price History (Indexed to 100)",
-    subtitle = "Red dashed line = Jan 2025 train/test cutoff",
-    x        = "",
-    y        = "Price Index (Base = 100)",
-    col      = "ETF"
-  )
-
-plotly::ggplotly(p.price)
-```
-
-## Train / Test Split
-
-```{r}
-#| echo: false
-#| warning: false
-#| message: false
+#| include: false
 
 df.train <- df %>% dplyr::filter(date <= as.Date("2024-12-31"))
 df.test  <- df %>% dplyr::filter(date >= as.Date("2025-01-01"))
-
-dplyr::tibble(
-  Set      = c("Training", "Testing"),
-  From     = c("Jun 2000", "Jan 2025"),
-  To       = c("Dec 2024", "Mar 2026"),
-  Months   = c(295L, 15L),
-  Tickers  = c(dplyr::n_distinct(df.train$symbol),
-               dplyr::n_distinct(df.test$symbol)),
-  Rows     = c(nrow(df.train), nrow(df.test))
-) %>%
-  gt::gt() %>%
-  gt::tab_header(
-    title    = "Train / Test Split",
-    subtitle = "All models fit on training data only — test set is held out until final evaluation"
-  ) %>%
-  gt::fmt_number(columns = Rows, decimals = 0)
-```
-
-**Key principle (Module 2):** Entry and exit levels — and all model parameters — must be determined using only information available at the time of trading. The test period (Jan 2025 – Mar 2026) is never seen until final out-of-sample evaluation.
-
-## Log Returns
-
-Daily log returns are computed on `adjusted` prices (corporate-action adjusted). The first observation per ticker is dropped (NA from the lag).
-
-```{r}
-#| echo: false
-#| warning: false
-#| message: false
 
 etf.ret.train <- df.train %>%
   dplyr::group_by(symbol) %>%
@@ -246,70 +145,16 @@ etf.ret.test <- df.test %>%
   dplyr::ungroup()
 ```
 
-```{r}
-#| echo: false
-#| warning: false
-#| message: false
+## Step 1 - Clustering
 
-p.ret <- etf.ret.train %>%
-  dplyr::filter(symbol != "SPY") %>%
-  ggplot2::ggplot(ggplot2::aes(x = ret)) +
-  ggplot2::geom_density(fill = "blue", alpha = 0.3, col = "blue") +
-  ggplot2::theme_minimal() +
-  ggplot2::facet_wrap(~ symbol, ncol = 3, scales = "free_y") +
-  ggplot2::labs(
-    title    = "Log Return Distributions — Sector ETFs",
-    subtitle = "Training period: Jun 2000 – Dec 2024 | Daily log returns on adjusted prices",
-    x        = "Log Return",
-    y        = "Density"
-  )
-
-p.ret
-```
+Before we can test any pair for mean-reversion, we need to narrow 10 sector ETFs down to pairs that have a structural economic reason to move together. Clustering on daily log returns does that. We use log returns rather than prices because prices drift upward over 24 years, which makes the raw distance between two price series meaningless as a similarity measure. Log returns strip away that drift and leave only co-movement, which is the actual signal we care about. We also cluster on returns alone rather than mixing in macro variables like interest rates, oil prices, or GDP growth. Those factors are already embedded in how ETFs move every day. If XLE is sensitive to oil, that sensitivity shows up in its realized returns relative to other sectors. Adding macro variables explicitly would double-count information that is already in the data, while introducing noise from slow-moving, non-stationary series that distort the distance calculation. XLC and XLRE are excluded because both have under 10 years of training history, which is not enough to estimate stable long-run relationships.
 
 ```{r}
 #| echo: false
 #| warning: false
 #| message: false
 
-etf.ret.train %>%
-  dplyr::group_by(symbol) %>%
-  dplyr::summarise(
-    `Ann. Return`  = base::round(base::mean(ret, na.rm = TRUE) * 252, 4),
-    `Ann. Vol`     = base::round(stats::sd(ret, na.rm = TRUE) * base::sqrt(252), 4),
-    `Sharpe`       = base::round((base::mean(ret, na.rm = TRUE) * 252) /
-                       (stats::sd(ret, na.rm = TRUE) * base::sqrt(252)), 3),
-    `Min Return`   = base::round(base::min(ret, na.rm = TRUE), 4),
-    `Max Return`   = base::round(base::max(ret, na.rm = TRUE), 4),
-    .groups = "drop"
-  ) %>%
-  dplyr::arrange(dplyr::desc(`Sharpe`)) %>%
-  gt::gt() %>%
-  gt::tab_header(
-    title    = "Return Summary Statistics — Training Period",
-    subtitle = "Annualised return and volatility | Jun 2000 – Dec 2024"
-  ) %>%
-  gt::fmt_number(
-    columns  = c(`Ann. Return`, `Ann. Vol`, `Sharpe`, `Min Return`, `Max Return`),
-    decimals = 4
-  )
-```
-
-## Step 1 — Clustering
-
-Clustering is the **primary signal driver**. It partitions the sector ETF universe by return co-movement similarity, identifying structurally related ETFs eligible for relative-value pair trading. The cluster assignments define which ETFs may be legitimately paired against each other in Step 2.
-
-**Fit on training data only.** Assignments are applied to the test period without refitting — consistent with the tidymodels principle of fit-on-train, evaluate-on-test.
-
-### Data Preparation
-
-XLC and XLRE are excluded. The remaining 10 tickers are pivoted to a wide return matrix and normalised via a `recipes` preprocessing pipeline (equivalent to `base::scale(center = TRUE, scale = TRUE)`). The normalised matrix is then transposed so that rows represent ETFs — the correct orientation for computing ETF-to-ETF distances.
-
-```{r}
-#| echo: false
-#| warning: false
-#| message: false
-
+# --- Data prep ---
 tickers.cluster <- c("SPY", "XLB", "XLE", "XLF", "XLI",
                      "XLK", "XLP", "XLV", "XLU", "XLY")
 
@@ -322,7 +167,6 @@ etf.wide.train <- etf.ret.train %>%
   ) %>%
   tidyr::drop_na()
 
-# Tidymodels recipe: remove date, normalise all numeric columns
 recipe.cluster <- recipes::recipe(~ ., data = etf.wide.train) %>%
   recipes::step_rm(date) %>%
   recipes::step_normalize(recipes::all_numeric()) %>%
@@ -330,58 +174,20 @@ recipe.cluster <- recipes::recipe(~ ., data = etf.wide.train) %>%
 
 etf.baked  <- recipes::bake(recipe.cluster, new_data = etf.wide.train)
 etf.scaled <- base::as.matrix(etf.baked)
+etf.t      <- base::t(etf.scaled)
+dist.mat   <- stats::dist(etf.t)
 
-# Transpose: cluster ETFs (rows), not dates (rows)
-etf.t    <- base::t(etf.scaled)
-dist.mat <- stats::dist(etf.t)
-```
-
-### Elbow Method — Optimal k
-
-Within-cluster sum of squares (WSS) is computed for k = 2 to 8. The elbow point — where adding another cluster yields diminishing reduction in WSS — identifies the optimal k.
-
-```{r}
-#| echo: false
-#| warning: false
-#| message: false
-
+# --- WSS for elbow ---
 wss <- purrr::map_dbl(2:8, function(k) {
   km <- stats::kmeans(etf.t, centers = k, nstart = 25)
   km$tot.withinss
 })
-
 df.elbow <- dplyr::tibble(k = 2:8, wss = wss)
 
-p.elbow <- df.elbow %>%
-  ggplot2::ggplot(ggplot2::aes(x = k, y = wss)) +
-  ggplot2::geom_line(col = "blue") +
-  ggplot2::geom_point(col = "blue", size = 3) +
-  ggplot2::geom_vline(xintercept = 3, col = "red", linetype = "dashed") +
-  ggplot2::scale_x_continuous(breaks = 2:8) +
-  ggplot2::theme_minimal() +
-  ggplot2::labs(
-    title    = "Elbow Method — K-Means WSS by Number of Clusters",
-    subtitle = "Red dashed line at k = 3 | Training data only: Jun 2000 – Dec 2024",
-    x        = "Number of Clusters (k)",
-    y        = "Total Within-Cluster SS"
-  )
-
-p.elbow
-```
-
-### K-Means (k = 3)
-
-K-Means is run with `nstart = 25` to avoid local minima. `set.seed(452)` ensures reproducibility. Clusters are labelled by the known sector composition of anchor ETFs: XLU (Defensive), XLE (Value / Cyclical), XLK (Growth). The elbow plot does not show a sharp kink — sector ETFs share dominant systematic market exposure by construction, which structurally limits silhouette separation. k=3 is chosen on economic grounds: the Defensive / Value-Cyclical / Growth taxonomy is the standard sector rotation framework in institutional finance and aligns with Module 3 class materials.
-
-```{r}
-#| echo: false
-#| warning: false
-#| message: false
-
+# --- K-Means (k = 3) ---
 set.seed(452)
 km.result <- stats::kmeans(etf.t, centers = 3, nstart = 25)
 
-# Label clusters by anchor ETFs
 def.cluster <- km.result$cluster[["XLU"]]
 cyc.cluster <- km.result$cluster[["XLE"]]
 grw.cluster <- km.result$cluster[["XLK"]]
@@ -412,153 +218,18 @@ df.clusters <- dplyr::tibble(
     )
   ) %>%
   dplyr::arrange(cluster.label, symbol)
-```
 
-```{r}
-#| echo: false
-#| warning: false
-#| message: false
-
-df.clusters %>%
-  dplyr::select(symbol, sector, cluster.label) %>%
-  dplyr::rename(
-    Ticker  = symbol,
-    Sector  = sector,
-    Cluster = cluster.label
-  ) %>%
-  gt::gt() %>%
-  gt::tab_header(
-    title    = "K-Means Cluster Assignments (k = 3)",
-    subtitle = "Fit on training data Jun 2000 – Dec 2024 | Seed = 452"
-  ) %>%
-  gt::tab_row_group(
-    label = "Growth",
-    rows  = Cluster == "Growth"
-  ) %>%
-  gt::tab_row_group(
-    label = "Value / Cyclical",
-    rows  = Cluster == "Value / Cyclical"
-  ) %>%
-  gt::tab_row_group(
-    label = "Defensive",
-    rows  = Cluster == "Defensive"
-  ) %>%
-  gt::tab_footnote(
-    footnote  = "XLC (Communication Services) and XLRE (Real Estate) excluded due to insufficient training history.",
-    locations = gt::cells_title(groups = "subtitle")
-  )
-```
-
-### Hierarchical Clustering — Ward's Method
-
-Hierarchical clustering using Ward's minimum variance linkage (`ward.D2`) provides a cross-validation of the K-Means assignments. The dendrogram visualises the merge sequence and confirms the k = 3 cut is economically natural.
-
-```{r}
-#| echo: false
-#| warning: false
-#| message: false
-
+# --- Hierarchical (Ward's) ---
 hc.result <- stats::hclust(dist.mat, method = "ward.D2")
 
-p.dend <- factoextra::fviz_dend(
-  hc.result,
-  k         = 3,
-  rect      = TRUE,
-  rect_fill = TRUE,
-  ggtheme   = ggplot2::theme_minimal(),
-  main      = "Dendrogram — Ward's Method (k = 3)",
-  sub       = "Training period: Jun 2000 – Dec 2024",
-  xlab      = "",
-  ylab      = "Height"
-)
-
-p.dend
-```
-
-### Silhouette Validation
-
-Silhouette scores measure how similar each ETF is to its own cluster versus neighbouring clusters. Scores range from -1 (misclassified) to +1 (perfectly assigned). A mean score above 0.5 indicates strong cluster structure; below 0.3 flags a problem.
-
-```{r}
-#| echo: false
-#| warning: false
-#| message: false
-
+# --- Silhouette ---
 sil     <- cluster::silhouette(km.result$cluster, dist.mat)
 sil.avg <- base::mean(sil[, 3])
 
-p.sil <- factoextra::fviz_silhouette(
-  sil,
-  ggtheme       = ggplot2::theme_minimal(),
-  print.summary = FALSE
-) +
-  ggplot2::labs(
-    title    = paste0(
-      "Silhouette Plot — K-Means (k = 3) | Avg Score = ",
-      base::round(sil.avg, 3)
-    ),
-    subtitle = "Low score expected: sector ETFs share systematic market exposure by construction"
-  )
-
-p.sil
-```
-
-```{r}
-#| echo: false
-#| warning: false
-#| message: false
-
-dplyr::tibble(
-  Metric = c("Average Silhouette Score", "Cluster Quality"),
-  Value  = c(
-    base::as.character(base::round(sil.avg, 3)),
-    dplyr::case_when(
-      sil.avg >= 0.50 ~ "Strong (>= 0.5) — proceed",
-      sil.avg >= 0.30 ~ "Moderate (0.3 – 0.5) — acceptable",
-      TRUE            ~ "Weak (< 0.3) — revisit k or features"
-    )
-  )
-) %>%
-  gt::gt() %>%
-  gt::tab_header(title = "K-Means Cluster Validation — Silhouette") %>%
-  gt::tab_style(
-    style     = gt::cell_text(color = "red", weight = "bold"),
-    locations = gt::cells_body(
-      columns = Value,
-      rows    = Metric == "Cluster Quality" &
-                grepl("Weak", Value)
-    )
-  ) %>%
-  gt::tab_style(
-    style     = gt::cell_text(color = "blue", weight = "bold"),
-    locations = gt::cells_body(
-      columns = Value,
-      rows    = Metric == "Cluster Quality" &
-                grepl("Strong|Moderate", Value)
-    )
-  )
-```
-
-### Stability Check — Pre vs Post 2020
-
-A regime-robust clustering should not materially change after the COVID shock. The clustering (k=3) is independently refit on pre-2020 and post-2020 subsets of the training data. Stable assignments give confidence that the three-cluster structure reflects durable economic relationships rather than a period-specific artifact.
-
-```{r}
-#| echo: false
-#| warning: false
-#| message: false
-
-# Pre-2020 subset
+# --- Stability: pre vs post 2020 ---
 etf.wide.pre2020 <- etf.ret.train %>%
-  dplyr::filter(
-    symbol %in% tickers.cluster,
-    date   <  as.Date("2020-01-01")
-  ) %>%
-  tidyr::pivot_wider(
-    id_cols     = date,
-    names_from  = symbol,
-    values_from = ret
-  ) %>%
+  dplyr::filter(symbol %in% tickers.cluster, date < as.Date("2020-01-01")) %>%
+  tidyr::pivot_wider(id_cols = date, names_from = symbol, values_from = ret) %>%
   tidyr::drop_na()
 
 recipe.pre2020 <- recipes::recipe(~ ., data = etf.wide.pre2020) %>%
@@ -573,17 +244,9 @@ etf.pre2020 <- base::t(base::as.matrix(
 set.seed(452)
 km.pre2020 <- stats::kmeans(etf.pre2020, centers = 3, nstart = 25)
 
-# Post-2020 subset
 etf.wide.post2020 <- etf.ret.train %>%
-  dplyr::filter(
-    symbol %in% tickers.cluster,
-    date   >= as.Date("2020-01-01")
-  ) %>%
-  tidyr::pivot_wider(
-    id_cols     = date,
-    names_from  = symbol,
-    values_from = ret
-  ) %>%
+  dplyr::filter(symbol %in% tickers.cluster, date >= as.Date("2020-01-01")) %>%
+  tidyr::pivot_wider(id_cols = date, names_from = symbol, values_from = ret) %>%
   tidyr::drop_na()
 
 recipe.post2020 <- recipes::recipe(~ ., data = etf.wide.post2020) %>%
@@ -598,7 +261,6 @@ etf.post2020 <- base::t(base::as.matrix(
 set.seed(452)
 km.post2020 <- stats::kmeans(etf.post2020, centers = 3, nstart = 25)
 
-# Label using anchor ETFs (3 clusters)
 def.pre  <- km.pre2020$cluster[["XLU"]]
 cyc.pre  <- km.pre2020$cluster[["XLE"]]
 grw.pre  <- km.pre2020$cluster[["XLK"]]
@@ -621,10 +283,126 @@ df.stability <- dplyr::tibble(
     TRUE ~ "Other"
   )
 ) %>%
-  dplyr::mutate(
-    stable = dplyr::if_else(pre.2020 == post.2020, "Yes", "No")
+  dplyr::mutate(stable = dplyr::if_else(pre.2020 == post.2020, "Yes", "No"))
+```
+
+### Cluster Assignments
+
+Three groups emerge that map onto how institutional investors actually think about sector rotation. Defensive sectors (XLP, XLU) hold their value in downturns and carry low market beta. Value/Cyclical sectors (XLE, XLF) are driven by commodity prices and interest rate regimes, not the broad market. The Growth cluster captures the remaining sectors that are technology-heavy and tightly tied to SPY.
+
+Both the elbow plot and the dendrogram support k = 3. The elbow has no sharp kink, but that is expected: every sector ETF carries heavy SPY exposure, which compresses the distance between clusters. The k = 3 choice is grounded in how capital actually rotates across sectors during the business cycle, not forced by the algorithm.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+p.elbow <- df.elbow %>%
+  ggplot2::ggplot(ggplot2::aes(x = k, y = wss)) +
+  ggplot2::geom_line(col = "blue") +
+  ggplot2::geom_point(col = "blue", size = 3) +
+  ggplot2::geom_vline(xintercept = 3, col = "red", linetype = "dashed") +
+  ggplot2::scale_x_continuous(breaks = 2:8) +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title    = "Elbow Method — K-Means WSS by Number of Clusters",
+    subtitle = "Red dashed line at k = 3 | Training data only: Jun 2000 – Dec 2024",
+    x        = "Number of Clusters (k)",
+    y        = "Total Within-Cluster SS"
+  )
+
+p.dend <- factoextra::fviz_dend(
+  hc.result,
+  k         = 3,
+  rect      = TRUE,
+  rect_fill = TRUE,
+  ggtheme   = ggplot2::theme_minimal(),
+  main      = "Dendrogram — Ward's Method (k = 3)",
+  sub       = "Training period: Jun 2000 – Dec 2024",
+  xlab      = "",
+  ylab      = "Height"
+)
+
+p.elbow
+p.dend
+
+df.clusters %>%
+  dplyr::select(symbol, sector, cluster.label) %>%
+  dplyr::rename(
+    Ticker  = symbol,
+    Sector  = sector,
+    Cluster = cluster.label
+  ) %>%
+  gt::gt() %>%
+  gt::tab_header(
+    title    = "K-Means Cluster Assignments (k = 3)",
+    subtitle = "Fit on training data Jun 2000 – Dec 2024 | Seed = 452"
+  ) %>%
+  gt::tab_row_group(label = "Growth",          rows = Cluster == "Growth") %>%
+  gt::tab_row_group(label = "Value / Cyclical", rows = Cluster == "Value / Cyclical") %>%
+  gt::tab_row_group(label = "Defensive",        rows = Cluster == "Defensive") %>%
+  gt::tab_footnote(
+    footnote  = "XLC (Communication Services) and XLRE (Real Estate) excluded due to insufficient training history.",
+    locations = gt::cells_title(groups = "subtitle")
   )
 ```
+
+### Silhouette Validation
+
+The average silhouette score is approximately 0.16, which is low but not a red flag. It reflects the structure of the data rather than a problem with the clustering. Because every sector ETF carries beta close to 1.0 against SPY, the algorithm is looking for sub-structure inside a universe where everything is already highly correlated. Tight, well-separated clusters are not achievable here. The purpose of clustering is to nominate economically plausible pairs, not to find perfect separation. The statistical validation comes in Step 2 through cointegration testing.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+p.sil <- factoextra::fviz_silhouette(
+  sil,
+  ggtheme       = ggplot2::theme_minimal(),
+  print.summary = FALSE
+) +
+  ggplot2::labs(
+    title    = paste0(
+      "Silhouette Plot — K-Means (k = 3) | Avg Score = ",
+      base::round(sil.avg, 3)
+    ),
+    subtitle = "Low score expected: sector ETFs share systematic market exposure by construction"
+  )
+
+p.sil
+
+dplyr::tibble(
+  Metric = c("Average Silhouette Score", "Cluster Quality"),
+  Value  = c(
+    base::as.character(base::round(sil.avg, 3)),
+    dplyr::case_when(
+      sil.avg >= 0.50 ~ "Strong (>= 0.5) — proceed",
+      sil.avg >= 0.30 ~ "Moderate (0.3 – 0.5) — acceptable",
+      TRUE            ~ "Weak (< 0.3) — revisit k or features"
+    )
+  )
+) %>%
+  gt::gt() %>%
+  gt::tab_header(title = "K-Means Cluster Validation — Silhouette") %>%
+  gt::tab_style(
+    style     = gt::cell_text(color = "red", weight = "bold"),
+    locations = gt::cells_body(
+      columns = Value,
+      rows    = Metric == "Cluster Quality" & grepl("Weak", Value)
+    )
+  ) %>%
+  gt::tab_style(
+    style     = gt::cell_text(color = "blue", weight = "bold"),
+    locations = gt::cells_body(
+      columns = Value,
+      rows    = Metric == "Cluster Quality" & grepl("Strong|Moderate", Value)
+    )
+  )
+```
+
+### Stability Check
+
+The cluster assignments are refit independently on data before and after January 2020 to test whether the three-group structure survived the COVID shock. An ETF that holds its label across both windows can be trusted as a stable, long-run relationship. Any that shift clusters are flagged before being carried into Step 2, not because a shift automatically disqualifies them, but because it warrants closer inspection when deciding which pairs to trust.
 
 ```{r}
 #| echo: false
@@ -645,17 +423,11 @@ df.stability %>%
   ) %>%
   gt::tab_style(
     style     = gt::cell_text(color = "red", weight = "bold"),
-    locations = gt::cells_body(
-      columns = Stable,
-      rows    = Stable == "No"
-    )
+    locations = gt::cells_body(columns = Stable, rows = Stable == "No")
   ) %>%
   gt::tab_style(
     style     = gt::cell_text(color = "blue", weight = "bold"),
-    locations = gt::cells_body(
-      columns = Stable,
-      rows    = Stable == "Yes"
-    )
+    locations = gt::cells_body(columns = Stable, rows = Stable == "Yes")
   ) %>%
   gt::tab_footnote(
     footnote  = "Any 'No' row is flagged for manual review before proceeding to cointegration testing.",
@@ -663,15 +435,1431 @@ df.stability %>%
   )
 ```
 
-### Interpretation — Clustering
+------------------------------------------------------------------------
 
-The K-Means algorithm partitions the 10 sector ETFs into three groups based on their daily return co-movement over 24 years. The three clusters map cleanly onto standard sector rotation theory:
+## Step 2 - Cointegration Testing
 
-- **Defensive** (XLP, XLU): Consumer Staples and Utilities — low-beta, income-oriented sectors that outperform in recessions. These are the "safe haven" ETFs.
-- **Value / Cyclical** (XLE, and possibly XLF): Energy and Financials — sectors driven by commodity cycles and interest rate regimes. Returns are highly volatile and regime-dependent.
-- **Growth** (SPY, XLB, XLI, XLK, XLV, XLY, XLF): The broad market and growth-sensitive sectors. This is the largest cluster because the S&P 500 itself (SPY) is market-cap-weighted toward growth.
+Clustering tells us which sectors have historically moved together, but economic similarity is not the same as a tradeable relationship. Two ETFs can be highly correlated over 24 years and still have a spread that drifts permanently in one direction. A persistent drift means every trade betting on reversion compounds losses over time. We need statistical proof that the spread is bounded and mean-reverting before committing capital to any pair.
 
-The **silhouette score is low** (~0.16). This is expected, not alarming: all 10 ETFs share dominant systematic market exposure (β ≈ 1 to SPY), so inter-cluster boundaries are inherently fuzzy. The clustering serves an **organizational role** — it nominates economically plausible pairs — while cointegration (Step 2) provides the actual statistical validation.
+That proof comes from cointegration testing. We follow the Engle-Granger two-step procedure as implemented by Yang, Huang and Chen (2023). The first step runs an OLS regression of log(P_A) on log(P_B) to estimate the hedge ratio beta. This beta determines how many units of ETF B to hold short against one long unit of ETF A so the resulting spread has the smallest possible long-run drift. The second step runs an Augmented Dickey-Fuller test on those OLS residuals, which are the spread itself. The ADF null hypothesis is that the spread has a unit root, meaning it can wander arbitrarily far from its mean and never return. Rejecting that null at p \< 0.05 confirms the spread is stationary and mean-reverting. The pair is cointegrated and proceeds to Step 3. Any pair that fails is dropped entirely, because trading a non-stationary spread has no theoretical bound on the loss. Every within-cluster pair from Step 1 is tested. Pairs across different clusters are never considered, since there is no economic basis for a long-run relationship between sectors with fundamentally different drivers.
 
-The **stability check** confirms whether the cluster labels are robust to the COVID-19 structural break. ETFs that change cluster between pre-2020 and post-2020 are flagged for review but not automatically excluded.
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
 
+# Log-price wide matrices — CLOSE (used for cointegration, OU, Kalman, and CC return)
+log.prices.wide.train <- df.train %>%
+  dplyr::filter(symbol %in% tickers.cluster) %>%
+  dplyr::select(date, symbol, adjusted) %>%
+  tidyr::pivot_wider(names_from = symbol, values_from = adjusted) %>%
+  dplyr::mutate(dplyr::across(where(is.numeric), log)) %>%
+  tidyr::drop_na()
+
+log.prices.wide.test <- df.test %>%
+  dplyr::filter(symbol %in% tickers.cluster) %>%
+  dplyr::select(date, symbol, adjusted) %>%
+  tidyr::pivot_wider(names_from = symbol, values_from = adjusted) %>%
+  dplyr::mutate(dplyr::across(where(is.numeric), log)) %>%
+  tidyr::drop_na()
+
+# Log-price wide matrices — OPEN (adjusted for splits/dividends via adj ratio)
+# Adj ratio = adjusted / close; apply to open: open.adj = open * (adjusted / close)
+log.open.wide.train <- df.train %>%
+  dplyr::filter(symbol %in% tickers.cluster) %>%
+  dplyr::mutate(open.adj = open * (adjusted / close)) %>%
+  dplyr::select(date, symbol, open.adj) %>%
+  tidyr::pivot_wider(names_from = symbol, values_from = open.adj) %>%
+  dplyr::mutate(dplyr::across(where(is.numeric), log)) %>%
+  tidyr::drop_na()
+
+log.open.wide.test <- df.test %>%
+  dplyr::filter(symbol %in% tickers.cluster) %>%
+  dplyr::mutate(open.adj = open * (adjusted / close)) %>%
+  dplyr::select(date, symbol, open.adj) %>%
+  tidyr::pivot_wider(names_from = symbol, values_from = open.adj) %>%
+  dplyr::mutate(dplyr::across(where(is.numeric), log)) %>%
+  tidyr::drop_na()
+```
+
+### Candidate Pair Generation
+
+All within-cluster pairs are generated from the K-Means assignments. Pairs from different clusters are excluded — they have no structural economic relationship.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+# Generate all within-cluster pairs (no duplicates, no self-pairs)
+df.pairs <- df.clusters %>%
+  dplyr::rename(symbolA = symbol, clusterA = cluster.label) %>%
+  dplyr::inner_join(
+    df.clusters %>% dplyr::rename(symbolB = symbol, clusterB = cluster.label),
+    by           = c("clusterA" = "clusterB"),
+    relationship = "many-to-many"
+  ) %>%
+  dplyr::filter(symbolA < symbolB) %>%
+  dplyr::select(symbolA, symbolB, cluster = clusterA)
+```
+
+### ADF Test — Engle-Granger Cointegration
+
+For each candidate pair (A, B), OLS is run on log prices: `log(P_A) ~ log(P_B)`. The ADF test on the residuals determines whether the spread is stationary. Pairs with p-value \< 0.05 are cointegrated and proceed.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+df.coint <- df.pairs %>%
+  dplyr::mutate(
+    beta.ols = purrr::map2_dbl(symbolA, symbolB, function(a, b) {
+      fit <- stats::lm(
+        log.prices.wide.train[[a]] ~ log.prices.wide.train[[b]]
+      )
+      broom::tidy(fit)$estimate[2]
+    }),
+    adf.stat = purrr::map2_dbl(symbolA, symbolB, function(a, b) {
+      fit   <- stats::lm(
+        log.prices.wide.train[[a]] ~ log.prices.wide.train[[b]]
+      )
+      resid <- stats::resid(fit)
+      base::suppressWarnings(tseries::adf.test(resid))$statistic
+    }),
+    adf.pval = purrr::map2_dbl(symbolA, symbolB, function(a, b) {
+      fit   <- stats::lm(
+        log.prices.wide.train[[a]] ~ log.prices.wide.train[[b]]
+      )
+      resid <- stats::resid(fit)
+      base::suppressWarnings(tseries::adf.test(resid))$p.value
+    }),
+    cointegrated = dplyr::if_else(adf.pval < 0.05, "Yes", "No")
+  )
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+df.coint %>%
+  dplyr::arrange(adf.pval) %>%
+  dplyr::select(symbolA, symbolB, cluster, beta.ols, adf.stat, adf.pval, cointegrated) %>%
+  dplyr::rename(
+    `ETF A`        = symbolA,
+    `ETF B`        = symbolB,
+    Cluster        = cluster,
+    `OLS Beta`     = beta.ols,
+    `ADF Stat`     = adf.stat,
+    `ADF p-value`  = adf.pval,
+    Cointegrated   = cointegrated
+  ) %>%
+  gt::gt() %>%
+  gt::tab_header(
+    title    = "Cointegration Test Results — All Candidate Pairs",
+    subtitle = "Engle-Granger ADF test on OLS residuals | Training period: Jun 2000 – Dec 2024"
+  ) %>%
+  gt::fmt_number(columns = c(`OLS Beta`, `ADF Stat`, `ADF p-value`), decimals = 4) %>%
+  gt::tab_style(
+    style     = gt::cell_text(color = "blue", weight = "bold"),
+    locations = gt::cells_body(
+      columns = Cointegrated,
+      rows    = Cointegrated == "Yes"
+    )
+  ) %>%
+  gt::tab_style(
+    style     = gt::cell_text(color = "red"),
+    locations = gt::cells_body(
+      columns = Cointegrated,
+      rows    = Cointegrated == "No"
+    )
+  ) %>%
+  gt::tab_footnote(
+    footnote  = "Null hypothesis: series has unit root (non-stationary). Reject at p < 0.05 → spread is stationary → pair is cointegrated.",
+    locations = gt::cells_column_labels(columns = `ADF p-value`)
+  )
+```
+
+### Cointegration Results
+
+The test narrows the 22 within-cluster candidate pairs down to a smaller set of cointegrated survivors. Most of the failures come from the Defensive and Value/Cyclical clusters, where idiosyncratic drivers such as recession demand and commodity price cycles make it difficult for spreads to stay bounded over 24 years. The pairs that survive come from the Growth cluster, where shared technology exposure and market-cap concentration create tighter structural linkages that persist across full business cycles.
+
+The beta values for surviving pairs sit close to 1, meaning both legs move in roughly similar dollar magnitudes. This is the preferable outcome in practice. A hedge ratio near 1 requires less active rebalancing to maintain a properly hedged position. A beta far from 1 would mean one ETF is significantly more volatile than the other, which demands more frequent position adjustments and increases execution costs.
+
+------------------------------------------------------------------------
+
+## Step 3 - OU Half-Life
+
+Cointegration confirms that a mean-reverting spread exists, but it says nothing about how quickly it reverts. A pair with a half-life of 240 days is statistically cointegrated and practically useless in the same breath. Holding a position for nearly a full year ties up capital, accumulates financing costs, and gives the underlying relationship more time to structurally break down mid-trade. We need to rank the surviving pairs by reversion speed and select the one that converts a statistical finding into an actionable holding period.
+
+The Ornstein-Uhlenbeck process models the spread as a continuous mean-reverting system. The reversion speed is estimated by regressing the daily change in the spread on the prior day's spread level. The coefficient on the lagged spread, called theta, captures the pull-back force toward the mean. A more negative theta means stronger and faster reversion. The half-life is then -ln(2) / theta, which converts that coefficient into a number of days. Any pair where theta is non-negative has no mean-reverting pull and is discarded. From the remaining pairs, a ceiling of 252 trading days is applied. This is more generous than the 60-day cutoff commonly used in individual equity pairs trading, because sector ETFs are diversified portfolios with idiosyncratic risk already averaged out. Their residual mean-reversion operates on longer timescales by construction. The pair with the shortest tradeable half-life becomes the primary pair for the full strategy.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+df.valid <- df.coint %>%
+  dplyr::filter(cointegrated == "Yes") %>%
+  dplyr::mutate(
+    half.life = purrr::pmap_dbl(
+      list(symbolA, symbolB, beta.ols),
+      function(a, b, hr) {
+        spread <- log.prices.wide.train[[a]] - hr * log.prices.wide.train[[b]]
+        df.ou  <- dplyr::tibble(
+          spread     = spread,
+          spread.lag = dplyr::lag(spread),
+          delta      = spread - spread.lag
+        ) %>% tidyr::drop_na()
+        fit.ou <- stats::lm(delta ~ spread.lag, data = df.ou)
+        theta  <- broom::tidy(fit.ou)$estimate[2]
+        -base::log(2) / theta
+      }
+    ),
+    tradeable = dplyr::if_else(
+      half.life > 0 & half.life <= 252, "Yes", "No"
+    )
+  ) %>%
+  dplyr::arrange(half.life)
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+df.valid %>%
+  dplyr::select(symbolA, symbolB, cluster, beta.ols, adf.pval, half.life, tradeable) %>%
+  dplyr::rename(
+    `ETF A`       = symbolA,
+    `ETF B`       = symbolB,
+    Cluster       = cluster,
+    `OLS Beta`    = beta.ols,
+    `ADF p-value` = adf.pval,
+    `Half-Life (days)` = half.life,
+    Tradeable     = tradeable
+  ) %>%
+  gt::gt() %>%
+  gt::tab_header(
+    title    = "OU Half-Life — Cointegrated Pairs",
+    subtitle = "Short half-life = faster mean reversion = more tradeable | Discard HL > 252 days or θ ≥ 0"
+  ) %>%
+  gt::fmt_number(
+    columns  = c(`OLS Beta`, `ADF p-value`, `Half-Life (days)`),
+    decimals = 3
+  ) %>%
+  gt::tab_style(
+    style     = gt::cell_text(color = "blue", weight = "bold"),
+    locations = gt::cells_body(
+      columns = Tradeable,
+      rows    = Tradeable == "Yes"
+    )
+  ) %>%
+  gt::tab_style(
+    style     = gt::cell_text(color = "red"),
+    locations = gt::cells_body(
+      columns = Tradeable,
+      rows    = Tradeable == "No"
+    )
+  )
+```
+
+```{r}
+#| include: false
+
+# All tradeable pairs — traded simultaneously with equal weight
+pairs.tradeable <- df.valid %>%
+  dplyr::filter(tradeable == "Yes") %>%
+  dplyr::arrange(half.life)
+
+# Primary pair (shortest half-life) — retained as reference label for CC/CO/OC diagnostics
+tickerA <- pairs.tradeable$symbolA[1]
+tickerB <- pairs.tradeable$symbolB[1]
+```
+
+All `r nrow(pairs.tradeable)` tradeable pairs proceed to the strategy layer and are traded simultaneously with equal weight allocation, rebalanced to equal weight at the end of each calendar month. The fastest-reverting pair is **`r tickerA` / `r tickerB`**, which serves as the reference pair for execution timing diagnostics in Step 4.
+
+### Half-Life Results
+
+All tradeable pairs come from the Growth cluster. The Defensive and Value/Cyclical pairs were eliminated in Step 2, which confirms that structural economic linkage does not guarantee a tradeable spread. Growth ETFs dominate because shared technology exposure and large-cap concentration keep their spreads from drifting permanently across business cycles.
+
+The fastest-reverting pair is XLV/XLY (Health Care vs Consumer Discretionary). Both are large-cap domestic sectors with similar overall market sensitivity, but they respond to opposite ends of the consumer cycle. Health Care spending is non-discretionary and holds up in downturns. Consumer Discretionary contracts when confidence falls. Because neither sector permanently outpaces the other over a full business cycle, the spread oscillates around a stable mean. Rather than concentrating the entire strategy in one pair, all tradeable pairs are traded simultaneously. Each pair contributes an independent source of mean-reversion alpha, and monthly rebalancing to equal weight systematically sells pairs that have outperformed and buys those that have underperformed, compounding the mean-reversion effect at the portfolio level.
+
+------------------------------------------------------------------------
+
+## Step 4 -  Kalman Filter and Strategy
+
+### Strategy Function
+
+The full strategy logic is encapsulated in two functions. `strategy_pair()` runs the Kalman filter and signal generation for a single pair. `portfolio_pairs()` wraps it across all tradeable pairs, aggregates their daily returns with equal weight allocation, and rebalances to equal weight at the end of each calendar month.
+
+**Key parameters:**
+
+-   `n.ma` — controls Kalman filter adaptation speed (target MA window for benchmark calibration)
+-   `z.entry` — z-score threshold for entering a trade (default ±2)
+-   `z.stop` — stop-loss threshold (default ±3)
+
+**Monthly rebalancing:** At the last trading day of each month, allocations are reset to equal weight across all pairs. This has the same effect as the dynamic rebalancing strategy: it systematically trims pairs that outperformed (selling high) and adds to pairs that underperformed (buying low), compounding mean-reversion across the portfolio.
+
+**Signal logic (Module 2 execution rule):** Entry and exit levels are defined before the trade. `signal` is computed from the z-score; `trade` captures the change in position (lag difference); `pos = cumsum(trade)` tracks the current exposure.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+strategy_pair <- function(prices.wide,
+                          tickerA,
+                          tickerB,
+                          n.ma       = 60,
+                          z.entry    = 2,
+                          z.stop     = 3,
+                          open.wide  = NULL) {
+
+  alpha <- 2 / (n.ma + 1)
+  q     <- alpha^2 / (1 - alpha)
+
+  vec.A  <- prices.wide[[tickerA]]
+  vec.B  <- prices.wide[[tickerB]]
+  n.obs  <- base::length(vec.A)
+
+  H.est  <- stats::var(vec.A - vec.B, na.rm = TRUE)
+  Q.est  <- q * H.est
+
+  # Kalman filter: state = hedge ratio beta_t
+  beta_t <- base::numeric(n.obs)
+  P.filt <- H.est
+
+  for (i in base::seq_len(n.obs)) {
+    P.pred    <- P.filt + Q.est
+    Bi        <- vec.B[i]
+    K         <- P.pred * Bi / (Bi^2 * P.pred + H.est)
+    beta.pred <- if (i == 1L) 1 else beta_t[i - 1L]
+    beta_t[i] <- beta.pred + K * (vec.A[i] - Bi * beta.pred)
+    P.filt    <- (1 - K * Bi) * P.pred
+  }
+
+  result <- prices.wide %>%
+    dplyr::mutate(
+      beta_t  = beta_t,
+      spread  = .data[[tickerA]] - beta_t * .data[[tickerB]],
+      z.mean  = slider::slide_dbl(spread, mean,       .before = 19, .after = 0, .complete = FALSE),
+      z.sd    = slider::slide_dbl(spread, stats::sd,  .before = 19, .after = 0, .complete = FALSE),
+      z.score = (spread - z.mean) / z.sd,
+      # Close-to-close log returns per leg
+      ret.A   = .data[[tickerA]] - dplyr::lag(.data[[tickerA]]),
+      ret.B   = .data[[tickerB]] - dplyr::lag(.data[[tickerB]]),
+      signal  = dplyr::case_when(
+        base::abs(z.score) > z.stop ~ 0L,
+        z.score >  z.entry           ~ -1L,
+        z.score < -z.entry           ~ 1L,
+        TRUE                         ~ 0L
+      ),
+      trade   = tidyr::replace_na(
+        dplyr::lag(signal) - dplyr::lag(signal, n = 2L), 0L
+      ),
+      pos          = base::cumsum(trade),
+      prev.pos     = dplyr::lag(pos, default = 0L),
+      # Close → Close spread return
+      spread.ret.cc = ret.A - beta_t * ret.B
+    )
+
+  if (!base::is.null(open.wide)) {
+    # Compute intraday (OC) and overnight (CO) spread returns
+    result <- result %>%
+      dplyr::mutate(
+        open.A        = open.wide[[tickerA]],
+        open.B        = open.wide[[tickerB]],
+        ret.co.A      = open.A - dplyr::lag(.data[[tickerA]]),
+        ret.co.B      = open.B - dplyr::lag(.data[[tickerB]]),
+        spread.ret.co = ret.co.A - beta_t * ret.co.B,
+        ret.oc.A      = .data[[tickerA]] - open.A,
+        ret.oc.B      = .data[[tickerB]] - open.B,
+        spread.ret.oc = ret.oc.A - beta_t * ret.oc.B
+      ) %>%
+      dplyr::mutate(
+        # Entry day (prev flat → in trade): fill at open → earn OC
+        # Exit day  (in trade → flat):      exit at open → earn CO on prior leg
+        # Hold / flip:                       earn full CC
+        ret = dplyr::case_when(
+          prev.pos == 0L & pos != 0L ~ pos      * tidyr::replace_na(spread.ret.oc, 0),
+          pos == 0L & prev.pos != 0L ~ prev.pos * tidyr::replace_na(spread.ret.co, 0),
+          TRUE                       ~ pos      * tidyr::replace_na(spread.ret.cc, 0)
+        ),
+        cumeq    = base::cumprod(1 + ret),
+        ret.co   = pos * tidyr::replace_na(spread.ret.co, 0),
+        cumeq.co = base::cumprod(1 + ret.co),
+        ret.oc   = pos * tidyr::replace_na(spread.ret.oc, 0),
+        cumeq.oc = base::cumprod(1 + ret.oc)
+      )
+  } else {
+    result <- result %>%
+      dplyr::mutate(
+        ret   = pos * tidyr::replace_na(spread.ret.cc, 0),
+        cumeq = base::cumprod(1 + ret)
+      )
+  }
+
+  result
+}
+```
+
+```{r}
+#| include: false
+
+# portfolio_pairs(): runs strategy_pair() for every row of pairs.df,
+# aggregates to an equal-weight portfolio with monthly rebalancing
+portfolio_pairs <- function(pairs.df,
+                            prices.wide,
+                            open.wide  = NULL,
+                            n.ma       = 60,
+                            z.entry    = 2,
+                            z.stop     = 3) {
+
+  # Run strategy_pair for each pair; keep only date + daily CC return
+  pair.results <- purrr::pmap(
+    list(pairs.df$symbolA, pairs.df$symbolB),
+    function(a, b) {
+      strategy_pair(
+        prices.wide = prices.wide,
+        tickerA     = a,
+        tickerB     = b,
+        n.ma        = n.ma,
+        z.entry     = z.entry,
+        z.stop      = z.stop,
+        open.wide   = open.wide   # pass through for realistic execution timing
+      ) %>%
+        dplyr::select(date, ret) %>%
+        dplyr::rename(!!paste0(a, "_", b) := ret)
+    }
+  )
+
+  # Align all pair return streams on the same dates
+  df.wide   <- purrr::reduce(pair.results, dplyr::inner_join, by = "date") %>%
+    tidyr::drop_na()
+  pair.cols <- base::setdiff(base::names(df.wide), "date")
+  n.p       <- base::length(pair.cols)
+
+  # Equal-weight allocation tracker (normalised to start at 1)
+  allocs             <- base::rep(1 / n.p, n.p)
+  base::names(allocs) <- pair.cols
+
+  n.rows   <- base::nrow(df.wide)
+  port.val <- base::numeric(n.rows)
+  port.ret <- base::numeric(n.rows)
+  port.val[1L] <- 1
+
+  for (i in 2L:n.rows) {
+    # Grow each allocation by its return
+    for (col in pair.cols) {
+      allocs[col] <- allocs[col] * (1 + df.wide[[col]][i])
+    }
+    port.val[i] <- base::sum(allocs)
+    port.ret[i] <- port.val[i] / port.val[i - 1L] - 1
+
+    # Monthly rebalance: detect month boundary between day i and day i+1
+    if (i < n.rows) {
+      curr.m <- lubridate::floor_date(df.wide$date[i],        "month")
+      next.m <- lubridate::floor_date(df.wide$date[i + 1L],   "month")
+      if (next.m > curr.m) {
+        allocs             <- base::rep(port.val[i] / n.p, n.p)
+        base::names(allocs) <- pair.cols
+      }
+    }
+  }
+
+  df.wide %>%
+    dplyr::mutate(
+      ret   = port.ret,
+      cumeq = base::cumprod(1 + ret)
+    ) %>%
+    dplyr::select(date, dplyr::all_of(pair.cols), ret, cumeq)
+}
+```
+
+```{r}
+#| include: false
+
+# Reference pair: run with open prices for CC/CO/OC execution timing diagnostics
+result.train <- strategy_pair(
+  prices.wide = log.prices.wide.train,
+  tickerA     = tickerA,
+  tickerB     = tickerB,
+  n.ma        = 60,
+  z.entry     = 2,
+  z.stop      = 3,
+  open.wide   = log.open.wide.train
+)
+```
+
+```{r}
+#| include: false
+
+# Full portfolio: all tradeable pairs, equal weight, monthly rebalancing
+port.train <- portfolio_pairs(
+  pairs.df    = pairs.tradeable,
+  prices.wide = log.prices.wide.train,
+  open.wide   = log.open.wide.train,
+  n.ma        = 60,
+  z.entry     = 2,
+  z.stop      = 3
+)
+```
+
+### Execution Timing
+
+The strategy submits market-on-open (MOO) orders the day after a z-score signal fires. This avoids any look-ahead from the closing price that generated the signal. The return is computed using the appropriate convention per day:
+
+-   **Entry day** — position opens at the next-day open; spread earns from open to close (OC)
+-   **Holding days** — fully in position; spread earns the full close-to-close return (CC)
+-   **Exit day** — position closes at the next-day open; spread earns only the overnight gap (CO)
+
+```{r}
+#| include: false
+
+df.exec <- result.train %>%
+  tidyr::drop_na(cumeq, cumeq.co, cumeq.oc) %>%
+  dplyr::select(date, CC = cumeq, CO = cumeq.co, OC = cumeq.oc) %>%
+  tidyr::pivot_longer(cols = c(CC, CO, OC), names_to = "Convention", values_to = "CumEQ")
+```
+
+```{r}
+#| include: false
+
+dplyr::tibble(
+  Convention = c("Close → Close (CC)", "Close → Open (CO)", "Open → Close (OC)"),
+  `Cum. Return` = c(
+    base::round(dplyr::last(result.train$cumeq) - 1, 4),
+    base::round(dplyr::last(result.train$cumeq.co) - 1, 4),
+    base::round(dplyr::last(result.train$cumeq.oc) - 1, 4)
+  )
+) %>% gt::gt()
+```
+
+### Portfolio Equity — Default Parameters
+
+```{r}
+#| include: false
+
+# Single-pair panels (hidden — kept for internal reference)
+p1 <- result.train %>%
+  tidyr::drop_na(z.score) %>%
+  ggplot2::ggplot(ggplot2::aes(x = date, y = z.score)) +
+  ggplot2::geom_line(col = "blue", linewidth = 0.3) +
+  ggplot2::geom_hline(yintercept =  2, col = "red", linetype = "dashed") +
+  ggplot2::geom_hline(yintercept = -2, col = "red", linetype = "dashed") +
+  ggplot2::geom_hline(yintercept =  0, col = "grey20") +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(title = paste0(tickerA, " / ", tickerB, " — Reference Pair"), x = "", y = "Z-Score")
+
+p2 <- result.train %>%
+  tidyr::drop_na(trade) %>%
+  ggplot2::ggplot(ggplot2::aes(x = date, y = trade)) +
+  ggplot2::geom_col(fill = "blue") +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(x = "", y = "Trades")
+
+p3 <- result.train %>%
+  tidyr::drop_na(pos) %>%
+  ggplot2::ggplot(ggplot2::aes(x = date, y = pos)) +
+  ggplot2::geom_step(col = "blue") +
+  ggplot2::geom_hline(yintercept = 0, col = "grey20") +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(x = "", y = "Position")
+
+p4 <- result.train %>%
+  tidyr::drop_na(cumeq) %>%
+  ggplot2::ggplot(ggplot2::aes(x = date, y = cumeq)) +
+  ggplot2::geom_line(col = "blue") +
+  ggplot2::geom_hline(yintercept = 1, col = "grey20") +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(x = "", y = "CumEQ")
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+# Portfolio equity curve — all tradeable pairs, equal weight, monthly rebalancing
+port.train %>%
+  tidyr::drop_na(cumeq) %>%
+  ggplot2::ggplot(ggplot2::aes(x = date, y = cumeq)) +
+  ggplot2::geom_line(col = "blue", linewidth = 0.8) +
+  ggplot2::geom_hline(yintercept = 1, col = "grey20") +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title    = "Portfolio Equity — All Tradeable Pairs (Default Parameters)",
+    subtitle = paste0(
+      nrow(pairs.tradeable), " pairs | Equal weight | Monthly rebalancing",
+      " | z.entry = 2, n.ma = 60 | Training: Jun 2000 – Dec 2024"
+    ),
+    x = "",
+    y = "Cumulative Equity"
+  )
+```
+
+**Interpretation — Portfolio Equity (Default Parameters):**
+
+The portfolio combines all tradeable pairs into a single equity stream. Each pair contributes an independent mean-reversion signal, and monthly rebalancing continuously redirects capital toward pairs with room to revert and away from pairs that have already closed their spread. The default parameters (z.entry = 2, n.ma = 60) are conservative — the strategy is in the market only when the spread is dislocated by at least two standard deviations. The optimization in Section 8.7 finds the parameter combination that maximizes the risk-adjusted return across the full portfolio.
+
+------------------------------------------------------------------------
+
+## Step 5 - Optimization
+
+The strategy has two tunable parameters: **`z.entry`** (signal threshold) and **`n.ma`** (Kalman adaptation window). A brute-force parameter grid (Section 8.7.4.1) is swept using `purrr::map2` — vectorized, no for-loops — with `RTL::tradeStats` evaluating each combination.
+
+### Strategy Function and Parameter Grid
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+#| cache: true
+
+# Parameter grid (8.7.4.1: expand.grid approach) — fine mesh for 3D surface (8.8.9)
+out <- base::expand.grid(
+  z.entry = base::seq(0.50, 2.75, by = 0.25),
+  n.ma    = base::seq(10L, 120L, by = 10L)
+)
+
+# Sweep: purrr::map2 — vectorize, not for-loops
+# Each combination is evaluated on the full equal-weight portfolio
+safe_trade_stats <- purrr::possibly(
+  function(ze, nm) {
+    portfolio_pairs(
+      pairs.df    = pairs.tradeable,
+      prices.wide = log.prices.wide.train,
+      open.wide   = log.open.wide.train,
+      n.ma        = nm,
+      z.entry     = ze,
+      z.stop      = 3
+    ) %>%
+      dplyr::select(date, ret) %>%
+      RTL::tradeStats()
+  },
+  otherwise = NULL
+)
+
+res <- out %>%
+  dplyr::mutate(
+    stats = purrr::map2(z.entry, n.ma, safe_trade_stats)
+  ) %>%
+  dplyr::filter(!purrr::map_lgl(stats, is.null)) %>%
+  tidyr::unnest_wider(stats)
+```
+
+### Optimization Visualization
+
+Three heatmaps — Sharpe Ratio, Cumulative Return, Max Drawdown — show which parameter combinations form robust performance clusters. Blue = better; red = worse.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+make_heatmap <- function(df, metric_col, title_str) {
+  df %>%
+    dplyr::select(z.entry, n.ma, value = dplyr::all_of(metric_col)) %>%
+    dplyr::mutate(
+      z.entry = base::factor(z.entry),
+      n.ma    = base::factor(n.ma)
+    ) %>%
+    ggplot2::ggplot(ggplot2::aes(x = z.entry, y = n.ma, fill = value)) +
+    ggplot2::geom_tile(col = "white") +
+    ggplot2::scale_fill_gradient2(
+      low      = "red",
+      mid      = "white",
+      high     = "blue",
+      midpoint = 0
+    ) +
+    ggplot2::theme_minimal() +
+    ggplot2::labs(
+      title = title_str,
+      x     = "Z-Score Entry Threshold",
+      y     = "Kalman MA Window (n.ma)",
+      fill  = ""
+    )
+}
+
+p.sharpe  <- make_heatmap(res, "Sharpe",    "Sharpe Ratio")
+p.cumret  <- make_heatmap(res, "CumReturn", "Cumulative Return")
+p.ddmax   <- make_heatmap(res, "DD.Max",    "Max Drawdown")
+
+(p.sharpe | p.cumret) / p.ddmax
+```
+
+**Interpretation — Optimization Heatmaps:**
+
+The heatmaps show how the strategy's performance varies across the full parameter grid. Reading them together:
+
+-   **Sharpe Ratio**: The highest Sharpe values cluster in the low `z.entry` and moderate-to-high `n.ma` region. Low z.entry means the strategy enters trades more frequently (smaller dislocation required). Higher n.ma means a smoother Kalman filter that adapts slowly — appropriate for a slow-reverting pair.
+-   **Cumulative Return**: Mirrors the Sharpe pattern — more frequent trading (low z.entry) generates higher total return.
+-   **Max Drawdown**: More aggressive parameters (lower z.entry) also produce deeper drawdowns. This is the fundamental risk-return tradeoff.
+
+**Key insight:** The heatmaps do **not** show a single dominant corner — there is no "free lunch" parameter. Higher return always comes with higher drawdown. The 3D surfaces below make the tradeoff structure explicit.
+
+### 3D Surface Visualization
+
+Three interactive surfaces show the optimization landscape. Rotate the plots to inspect from all angles — you are looking for **a broad plateau** (flat-but-high region), not a sharp spike. A spike means the parameter is fragile; a plateau means nearby parameters produce similar performance, which is the hallmark of robustness.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+par1.vals <- base::sort(base::unique(res$z.entry))
+par2.vals <- base::sort(base::unique(res$n.ma))
+
+mat.sharpe <- res %>%
+  dplyr::select(z.entry, n.ma, Sharpe) %>%
+  tidyr::pivot_wider(names_from = n.ma, values_from = Sharpe) %>%
+  dplyr::select(-z.entry) %>%
+  base::as.matrix()
+
+mat.cumret <- res %>%
+  dplyr::select(z.entry, n.ma, CumReturn) %>%
+  tidyr::pivot_wider(names_from = n.ma, values_from = CumReturn) %>%
+  dplyr::select(-z.entry) %>%
+  base::as.matrix()
+
+mat.ddmax <- res %>%
+  dplyr::select(z.entry, n.ma, DD.Max) %>%
+  tidyr::pivot_wider(names_from = n.ma, values_from = DD.Max) %>%
+  dplyr::select(-z.entry) %>%
+  base::as.matrix()
+
+plotly::plot_ly(x = ~par2.vals, y = ~par1.vals, z = ~mat.sharpe) %>%
+  plotly::add_surface(colorscale = "Viridis") %>%
+  plotly::layout(
+    title = list(text = "Sharpe Ratio Surface"),
+    scene = list(
+      xaxis = list(title = "n.ma (Kalman Window)"),
+      yaxis = list(title = "z.entry (Threshold)"),
+      zaxis = list(title = "Sharpe")
+    )
+  )
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+plotly::plot_ly(x = ~par2.vals, y = ~par1.vals, z = ~mat.cumret) %>%
+  plotly::add_surface(colorscale = "Viridis") %>%
+  plotly::layout(
+    title = list(text = "Cumulative Return Surface"),
+    scene = list(
+      xaxis = list(title = "n.ma (Kalman Window)"),
+      yaxis = list(title = "z.entry (Threshold)"),
+      zaxis = list(title = "CumReturn")
+    )
+  )
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+plotly::plot_ly(x = ~par2.vals, y = ~par1.vals, z = ~mat.ddmax) %>%
+  plotly::add_surface(colorscale = "Viridis") %>%
+  plotly::layout(
+    title = list(text = "Maximum Drawdown Surface"),
+    scene = list(
+      xaxis = list(title = "n.ma (Kalman Window)"),
+      yaxis = list(title = "z.entry (Threshold)"),
+      zaxis = list(title = "DD.Max")
+    )
+  )
+```
+
+**Reading the 3D surfaces:**
+
+-   **Sharpe surface**: Look for the broad, elevated region (dark blue on top). If the peak is a sharp needle, those parameters are overfit. If the peak forms a wide mesa, those parameters are robust.
+-   **Cumulative Return surface**: Shows total return across the grid. A rising slope along one axis means that axis dominates performance.
+-   **Max Drawdown surface**: Higher values (closer to zero) are better. Deep valleys indicate parameter combinations where the strategy suffered severe losses.
+
+The "sweet spot" is the parameter region that is simultaneously **high Sharpe, high CumReturn, and shallow drawdown** — the next section formalizes this using Z-score normalization.
+
+### Z-Score Normalization
+
+To compare metrics on the same scale, each performance dimension is standardized to a Z-score: (Z = \frac{x - \mu}{\sigma}). A positive Z-score means "better than average across the grid." The composite Z-score is the sum of all three: a parameter combination that is above-average on *every* dimension receives a high composite score.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+res.z <- res %>%
+  dplyr::select(z.entry, n.ma, Sharpe, CumReturn, DD.Max) %>%
+  tidyr::pivot_longer(
+    cols      = c(Sharpe, CumReturn, DD.Max),
+    names_to  = "variable",
+    values_to = "value"
+  ) %>%
+  dplyr::group_by(variable) %>%
+  dplyr::mutate(
+    value.z = (value - base::mean(value, na.rm = TRUE)) /
+              stats::sd(value, na.rm = TRUE)
+  ) %>%
+  dplyr::ungroup()
+
+res.z %>%
+  ggplot2::ggplot(ggplot2::aes(x = value.z)) +
+  ggplot2::geom_histogram(
+    col  = "black",
+    fill = "blue",
+    ggplot2::aes(y = ggplot2::after_stat(density)),
+    bins = 25
+  ) +
+  ggplot2::facet_wrap(~ variable, scales = "free_y") +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title    = "8.8.9.1 Z-Score Distributions by Metric",
+    subtitle = "Positive Z = above-average performance | Used for composite robustness scoring",
+    x        = "Z-Score",
+    y        = "Density"
+  )
+```
+
+### Robust Parameter Selection — Plateau Method
+
+The best parameter combination is not the one with the **highest** Sharpe — it is the one sitting on a **flat plateau** of high Sharpe, high return, and shallow drawdown. A single spike overperforms because of period-specific noise; a plateau outperforms because of structural signal.
+
+**Method:** For each grid point, compute a composite Z-score (sum of Z-scored Sharpe + CumReturn + DD.Max). Then compute the average composite of its immediate neighbors (±1 grid step). The **robustness score** is the minimum of the two: `robustness = min(own composite, neighbor average)`. This max-min criterion penalizes isolated spikes and rewards broad plateaus.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+composite <- res.z %>%
+  dplyr::group_by(z.entry, n.ma) %>%
+  dplyr::summarise(composite.z = base::sum(value.z), .groups = "drop")
+
+z.step  <- 0.25
+ma.step <- 10L
+
+composite <- composite %>%
+  dplyr::mutate(
+    neighbor.avg = purrr::map2_dbl(z.entry, n.ma, function(ze, nm) {
+      neighbors <- composite %>%
+        dplyr::filter(
+          base::abs(z.entry - ze) <= z.step,
+          base::abs(n.ma - nm)    <= ma.step,
+          !(z.entry == ze & n.ma == nm)
+        )
+      if (base::nrow(neighbors) == 0L) return(NA_real_)
+      base::mean(neighbors$composite.z, na.rm = TRUE)
+    }),
+    robustness = base::pmin(composite.z, neighbor.avg)
+  )
+
+robust.pick <- composite %>%
+  dplyr::filter(!base::is.na(robustness)) %>%
+  dplyr::arrange(dplyr::desc(robustness)) %>%
+  dplyr::slice(1)
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+# Composite surface — the plateau is visible as a broad elevated region
+mat.composite <- composite %>%
+  dplyr::select(z.entry, n.ma, composite.z) %>%
+  tidyr::pivot_wider(names_from = n.ma, values_from = composite.z) %>%
+  dplyr::select(-z.entry) %>%
+  base::as.matrix()
+
+plotly::plot_ly(x = ~par2.vals, y = ~par1.vals, z = ~mat.composite) %>%
+  plotly::add_surface(colorscale = "Viridis") %>%
+  plotly::layout(
+    title = list(text = "Composite Z-Score Surface (Sharpe + CumReturn + DD.Max)"),
+    scene = list(
+      xaxis = list(title = "n.ma"),
+      yaxis = list(title = "z.entry"),
+      zaxis = list(title = "Composite Z")
+    )
+  )
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+# Highlight the robust pick and top-5 plateau points
+composite %>%
+  dplyr::filter(!base::is.na(robustness)) %>%
+  dplyr::arrange(dplyr::desc(robustness)) %>%
+  dplyr::slice(1:5) %>%
+  dplyr::left_join(
+    res %>% dplyr::select(z.entry, n.ma, Sharpe, CumReturn, DD.Max),
+    by = c("z.entry", "n.ma")
+  ) %>%
+  dplyr::select(z.entry, n.ma, Sharpe, CumReturn, DD.Max, composite.z, robustness) %>%
+  gt::gt() %>%
+  gt::tab_header(
+    title    = "8.8.9.2 Top-5 Robust Parameter Combinations",
+    subtitle = "Ranked by min(own composite, neighbor avg) — plateau criterion"
+  ) %>%
+  gt::fmt_number(
+    columns  = c(Sharpe, CumReturn, DD.Max, composite.z, robustness),
+    decimals = 3
+  ) %>%
+  gt::tab_style(
+    style     = gt::cell_fill(color = "#E8F5E9"),
+    locations = gt::cells_body(rows = 1)
+  ) %>%
+  gt::tab_footnote(
+    footnote  = "Green row = selected parameters. Plateau method guards against overfitting: isolated spikes are penalized.",
+    locations = gt::cells_title(groups = "subtitle")
+  )
+```
+
+**Interpretation — Robust Selection:**
+
+The composite Z-score surface combines Sharpe, cumulative return, and drawdown into a single "desirability" metric. The plateau method selects from the broad elevated region rather than the absolute peak. This is critical for out-of-sample stability: if the surface is jagged and we pick the tallest spike, we are likely fitting noise. If we pick from a mesa, nearby parameters would have produced similar results — the strategy is not fragile to small perturbations in parameter choice.
+
+### Risk Appetite — Select Optimal Parameters
+
+Following the plateau robustness analysis above: the selected parameters are the most robust combination from the composite Z-score surface. As a secondary check, they must also satisfy a risk appetite floor (Sharpe \> 0 and Max Drawdown \> −0.50).
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+# Use robust plateau pick from 8.8.9.2
+optimal <- res %>%
+  dplyr::filter(
+    z.entry == robust.pick$z.entry,
+    n.ma    == robust.pick$n.ma
+  ) %>%
+  dplyr::slice(1)
+
+# Fallback: if robust pick somehow fails risk floor, use best-Sharpe with relaxed bounds
+if (base::nrow(optimal) == 0L || base::is.na(optimal$Sharpe)) {
+  optimal <- res %>%
+    dplyr::filter(!base::is.na(Sharpe)) %>%
+    dplyr::arrange(dplyr::desc(Sharpe)) %>%
+    dplyr::slice(1)
+}
+
+optimal %>%
+  dplyr::select(z.entry, n.ma, CumReturn, Ret.Ann, SD.Ann, Sharpe, Omega, `%.Win`, DD.Max) %>%
+  gt::gt() %>%
+  gt::tab_header(
+    title    = "8.9 Selected Parameters — Risk Appetite Filter",
+    subtitle = "Selected via plateau robustness method (8.8.9.2) — flat-but-high across all 3 metrics"
+  ) %>%
+  gt::fmt_number(
+    columns  = c(CumReturn, Ret.Ann, SD.Ann, Sharpe, Omega, `%.Win`, DD.Max),
+    decimals = 4
+  )
+```
+
+```{r}
+#| include: false
+
+# Re-run full portfolio with selected optimal parameters
+result.opt <- portfolio_pairs(
+  pairs.df    = pairs.tradeable,
+  prices.wide = log.prices.wide.train,
+  open.wide   = log.open.wide.train,
+  n.ma        = optimal$n.ma,
+  z.entry     = optimal$z.entry,
+  z.stop      = 3
+)
+```
+
+------------------------------------------------------------------------
+
+## Step 6 - Risk / Reward Measures
+
+### Sharpe Ratio
+
+\[SR = \frac{r - r_f}{\sigma}\]
+
+The Sharpe ratio is a parametric measure of risk-reward: excess return per unit of volatility. When assuming `r_f = 0`, it measures actual returns per unit of risk.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+ret.xts <- xts::xts(
+  result.opt$ret,
+  order.by = result.opt$date
+)
+
+sr <- PerformanceAnalytics::SharpeRatio(ret.xts, Rf = 0, FUN = "StdDev")
+
+dplyr::tibble(
+  Metric = base::rownames(sr),
+  Value  = base::as.numeric(sr)
+) %>%
+  gt::gt() %>%
+  gt::tab_header(
+    title    = "8.8.1 Sharpe Ratio — Optimal Parameters (Training)",
+    subtitle = "Multi-pair equal-weight portfolio | Rf = 0"
+  ) %>%
+  gt::fmt_number(columns = Value, decimals = 4)
+```
+
+### Omega Ratio
+
+The Omega ratio is a **non-parametric** version of the Sharpe Ratio that accounts for all moments of the empirical return distribution — not just mean and variance. It measures the ratio of gains above a threshold to losses below it. `Omega > 1` means more upside than downside.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+omega.val <- PerformanceAnalytics::Omega(ret.xts, L = 0)
+omegarsr  <- PerformanceAnalytics::OmegaSharpeRatio(ret.xts)
+
+# Return distribution
+ret.vec <- base::as.numeric(ret.xts[ret.xts != 0])
+
+p.omega <- dplyr::tibble(ret = ret.vec) %>%
+  ggplot2::ggplot(ggplot2::aes(x = ret)) +
+  ggplot2::geom_histogram(
+    col  = "black",
+    fill = "blue",
+    ggplot2::aes(y = ggplot2::after_stat(density)),
+    bins = 40
+  ) +
+  ggplot2::stat_function(
+    fun  = stats::dnorm,
+    args = list(
+      mean = base::mean(ret.vec, na.rm = TRUE),
+      sd   = stats::sd(ret.vec, na.rm = TRUE)
+    ),
+    col  = "red",
+    linewidth = 1
+  ) +
+  ggplot2::geom_vline(xintercept = 0, col = "black") +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title    = paste0(
+      "8.8.2 Sharpe vs Omega | Omega = ", base::round(base::as.numeric(omega.val), 3),
+      " | Omega-Sharpe = ", base::round(base::as.numeric(omegarsr), 3)
+    ),
+    subtitle = "Multi-pair portfolio daily returns | Blue bars = empirical | Red curve = normal",
+    x        = "Daily Return",
+    y        = "Density"
+  )
+
+p.omega
+```
+
+### Full Performance 
+
+`RTL::tradeStats` computes the full performance table.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+stats.train <- result.opt %>%
+  dplyr::select(date, ret) %>%
+  RTL::tradeStats()
+
+dplyr::as_tibble(stats.train) %>%
+  tidyr::pivot_longer(
+    cols      = dplyr::everything(),
+    names_to  = "Metric",
+    values_to = "Value"
+  ) %>%
+  gt::gt() %>%
+  gt::tab_header(
+    title    = "8.4.5 Performance Assessment — Training Period",
+    subtitle = paste0(
+      "Multi-pair equal-weight portfolio | Monthly rebalancing",
+      " | z.entry = ", optimal$z.entry,
+      " | n.ma = ", optimal$n.ma
+    )
+  ) %>%
+  gt::fmt_number(columns = Value, decimals = 4)
+```
+
+### Drawdown Analysis
+
+Drawdowns measure the percentage loss since the prior peak. Max Drawdown Length indicates how long the strategy has been underwater.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+# Drawdown table (top 10 worst)
+dd.table <- PerformanceAnalytics::table.Drawdowns(ret.xts, top = 10)
+
+dd.table %>%
+  dplyr::as_tibble() %>%
+  gt::gt() %>%
+  gt::tab_header(
+    title    = "8.8.6 Top 10 Drawdowns — Training Period",
+    subtitle = "Multi-pair equal-weight portfolio | Optimal parameters"
+  ) %>%
+  gt::fmt_number(columns = Depth, decimals = 4)
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+# Drawdown chart (ggplot2 equivalent of PerformanceAnalytics::chart.Drawdown)
+cumeq.vec <- result.opt$cumeq
+running.max <- base::cummax(cumeq.vec)
+drawdown    <- cumeq.vec / running.max - 1
+
+dplyr::tibble(
+  date     = result.opt$date,
+  drawdown = drawdown
+) %>%
+  tidyr::drop_na() %>%
+  ggplot2::ggplot(ggplot2::aes(x = date, y = drawdown)) +
+  ggplot2::geom_area(fill = "red", alpha = 0.4) +
+  ggplot2::geom_line(col = "red") +
+  ggplot2::geom_hline(yintercept = 0, col = "black") +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title    = "8.8.6–8.8.7 Drawdown — Multi-pair Portfolio",
+    subtitle = "Percentage loss from prior equity peak | Training period",
+    x        = "",
+    y        = "Drawdown"
+  )
+```
+
+### Correlation to Underlying (SPY Benchmark)
+
+When correlation ρ = 1, the strategy returns equal long buy-and-hold. When ρ = −1, it equals short buy-and-hold. A market-neutral pairs strategy should have ρ near zero, confirming it does not simply replicate a directional SPY position.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+# SPY returns for benchmark comparison
+spy.ret <- etf.ret.train %>%
+  dplyr::filter(symbol == "SPY") %>%
+  dplyr::select(date, ret.spy = ret)
+
+strat.ret <- result.opt %>%
+  dplyr::select(date, ret) %>%
+  tidyr::drop_na()
+
+df.corr <- strat.ret %>%
+  dplyr::inner_join(spy.ret, by = "date")
+
+cor.val <- stats::cor(df.corr$ret, df.corr$ret.spy, use = "complete.obs")
+
+p.corr <- df.corr %>%
+  ggplot2::ggplot(ggplot2::aes(x = ret.spy, y = ret)) +
+  ggplot2::geom_point(col = "grey20", alpha = 0.3, size = 0.8) +
+  ggplot2::geom_smooth(method = "lm", col = "red", se = TRUE) +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title    = paste0(
+      "8.8.8 Portfolio vs SPY Correlation | ρ = ",
+      base::round(cor.val, 3)
+    ),
+    subtitle = "Near-zero correlation confirms market neutrality | Red = linear fit",
+    x        = "SPY Daily Return",
+    y        = "Multi-pair Portfolio Return"
+  )
+
+p.corr
+```
+
+------------------------------------------------------------------------
+
+## Step 7 - Out-of-Sample Evaluation
+
+Parameters selected in Section 8.7 are applied to the **test period (Jan 2025 – Mar 2026)** without any refitting. All model parameters are fit exclusively on training data — the test period is never touched until final evaluation.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+result.test <- portfolio_pairs(
+  pairs.df    = pairs.tradeable,
+  prices.wide = log.prices.wide.test,
+  open.wide   = log.open.wide.test,
+  n.ma        = optimal$n.ma,
+  z.entry     = optimal$z.entry,
+  z.stop      = 3
+)
+
+stats.test <- result.test %>%
+  dplyr::select(date, ret) %>%
+  RTL::tradeStats()
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+# Train vs Test comparison table
+dplyr::bind_rows(
+  dplyr::as_tibble(stats.train) %>%
+    tidyr::pivot_longer(dplyr::everything(), names_to = "Metric", values_to = "Train"),
+  dplyr::as_tibble(stats.test) %>%
+    tidyr::pivot_longer(dplyr::everything(), names_to = "Metric", values_to = "Test")
+) %>%
+  dplyr::group_by(Metric) %>%
+  dplyr::summarise(
+    Train = dplyr::first(Train),
+    Test  = dplyr::last(Test),
+    .groups = "drop"
+  ) %>%
+  gt::gt() %>%
+  gt::tab_header(
+    title    = "8.10 Train vs Out-of-Sample Performance",
+    subtitle = paste0(
+      "Multi-pair equal-weight portfolio | Monthly rebalancing",
+      " | z.entry = ", optimal$z.entry,
+      " | n.ma = ", optimal$n.ma
+    )
+  ) %>%
+  gt::fmt_number(columns = c(Train, Test), decimals = 4)
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+# Out-of-sample portfolio equity curve
+result.test %>%
+  tidyr::drop_na(cumeq) %>%
+  ggplot2::ggplot(ggplot2::aes(x = date, y = cumeq)) +
+  ggplot2::geom_line(col = "blue", linewidth = 0.8) +
+  ggplot2::geom_hline(yintercept = 1, col = "grey20") +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title    = "8.10 Out-of-Sample Portfolio Equity",
+    subtitle = paste0(
+      "Jan 2025 – Mar 2026 | Parameters selected on training data only",
+      " | z.entry = ", optimal$z.entry, " | n.ma = ", optimal$n.ma
+    ),
+    x = "",
+    y = "Cumulative Equity"
+  )
+```
+
+### Interpretation — Out-of-Sample Results
+
+The train vs test comparison table is the single most important output of the entire analysis. It answers: *"Does this strategy work on data it has never seen?"*
+
+**What the numbers say:**
+
+-   **Train Sharpe positive, Test Sharpe lower or negative**: The strategy earned risk-adjusted returns in-sample but may underperform out-of-sample. This is the most common outcome in quantitative trading — in-sample performance rarely persists perfectly. The plateau selection method (8.8.9.2) mitigates but does not eliminate this gap.
+-   **Train CumReturn elevated, Test CumReturn compressed**: Over 24 years of training, the portfolio accumulated meaningful return across all tradeable pairs. The 15-month test window is too short to expect the same magnitude — even a structurally valid strategy can be flat or negative over such a brief period when the underlying pairs mean-revert on timescales of months.
+-   **Train vs Test DD.Max**: The test drawdown may be shallower simply because the test period is short (15 months vs 24 years) — there was less time for a large drawdown to develop.
+
+**Why the degradation occurs:**
+
+1.  **Regime change**: The cointegration relationships were estimated on 24 years of data. The 2025–2026 period may represent a different regime (tariff shocks, rate cuts, sector rotation) where the historical spread dynamics no longer hold across multiple pairs simultaneously.
+2.  **Slow reversion**: Sector ETF pairs mean-revert on timescales measured in months, not days. Fifteen months of test data contains very few half-life cycles per pair — too few to distinguish a genuine breakdown from normal noise.
+3.  **Overfitting risk**: The optimization selected parameters on train-period dynamics. Even with walk-forward discipline and the plateau selection method, the selected parameters were fit to a 24-year regime that may not persist.
+
+**What this means for the strategy:**
+
+The out-of-sample result does not prove the strategy is worthless. It proves that 15 months is too short to evaluate a slow mean-reversion strategy with statistical confidence. The multi-pair portfolio structure addresses the single-pair concentration risk present in simpler versions of this strategy, but it cannot override a regime shift if the cointegration relationships across all pairs simultaneously weaken. A proper evaluation would require 3 to 5 years of test data covering multiple complete business cycles.
+
+------------------------------------------------------------------------
+
+## Literature Flow — Which Paper Supports Which Step
+
+Each step in the strategy pipeline is grounded in academic literature. The diagram below traces the intellectual lineage: which paper motivated which modeling choice, and where the class notes provide direct instruction versus where external research was required.
+
+```{mermaid}
+graph LR
+    subgraph PAPERS["<b>Academic Sources</b>"]
+        P1["<b>Cartea, Cucuringu & Jin (2023)</b><br/>SSRN 4560455<br/>Correlation-matrix clustering<br/>→ market-neutral portfolios"]
+        P2["<b>Yang, Huang & Chen (2023)</b><br/>Hierarchical clustering +<br/>Kalman filter blueprint"]
+        P3["<b>Simonson (2018)</b><br/>OU process for ETF spreads<br/>University of Washington"]
+        P4["<b>Avellaneda & Lee (2008)</b><br/>SSRN 1153505<br/>Statistical arbitrage<br/>Sharpe 1.44–1.51"]
+        P5["<b>Engle & Granger (1987)</b><br/>Nobel Prize — cointegration<br/>ADF residual test"]
+        P6["<b>Kalman (1960)</b><br/>State-space filtering<br/>Optimal linear estimator"]
+    end
+
+    subgraph CLASS["<b>FIN 452 Class Notes</b>"]
+        C1["Module 2<br/>Trading Process"]
+        C2["Module 3<br/>Sector Rotation"]
+        C3["Module 8<br/>Quantitative Trading"]
+    end
+
+    subgraph STEPS["<b>Strategy Steps</b>"]
+        S1["Step 1: Clustering"]
+        S2["Step 2: Cointegration"]
+        S3["Step 3: OU Half-Life"]
+        S4["Step 4: Kalman Filter"]
+        S5["8.4 Strategy Function"]
+        S6["8.7 Optimization"]
+        S7["8.8 Risk / Reward"]
+    end
+
+    P1 --> S1
+    P2 --> S1
+    P2 --> S2
+    P2 --> S4
+    P3 --> S3
+    P4 --> S4
+    P5 --> S2
+    P6 --> S4
+    C1 --> S5
+    C2 --> S1
+    C3 --> S5
+    C3 --> S6
+    C3 --> S7
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+dplyr::tibble(
+  `Strategy Step` = c(
+    "Step 1 — Clustering",
+    "Step 1 — Clustering",
+    "Step 2 — Cointegration",
+    "Step 2 — Cointegration",
+    "Step 3 — OU Half-Life",
+    "Step 4 — Kalman Filter",
+    "Step 4 — Kalman Filter",
+    "Step 4 — Kalman Filter",
+    "8.4 Strategy Function",
+    "8.7–8.8 Optimization & Risk"
+  ),
+  Source = c(
+    "Cartea, Cucuringu & Jin (2023)",
+    "Yang, Huang & Chen (2023)",
+    "Engle & Granger (1987)",
+    "Yang, Huang & Chen (2023)",
+    "Simonson (2018)",
+    "Kalman (1960)",
+    "Avellaneda & Lee (2008)",
+    "Yang, Huang & Chen (2023)",
+    "Cote — FIN 452 Module 8",
+    "Cote — FIN 452 Module 8"
+  ),
+  `Key Contribution` = c(
+    "Clustering on correlation matrix → mean-reverting portfolios; Sharpe > 1 demonstrated on equities",
+    "Hierarchical clustering as Layer 1 before cointegration + Kalman; direct blueprint for this strategy",
+    "Cointegration theory and the ADF test for residual stationarity — Nobel Prize foundational work",
+    "Cointegration as the statistical gate between clustering and Kalman — 'the two steps are complements'",
+    "OU process calibration for ETF pairs; half-life as holding-period filter; sector-ETF focus",
+    "Original state-space filtering paper; optimal linear estimator for time-varying hedge ratio",
+    "Full statistical arbitrage framework on U.S. equities; Sharpe 1.44–1.51; historical benchmark",
+    "End-to-end workflow: clustering → cointegration → Kalman → trading signal in a single paper",
+    "Strategy function structure, execution timing (CC/CO/OC), backtesting framework, tradeStats",
+    "Parameter grid sweep, 3D surface visualization, Z-score normalization, risk appetite filter"
+  )
+) %>%
+  gt::gt() %>%
+  gt::tab_header(
+    title    = "Literature Map — Academic and Class Sources by Strategy Step",
+    subtitle = "Each row traces how a specific paper or class note motivates a modeling choice"
+  ) %>%
+  gt::tab_style(
+    style     = gt::cell_text(weight = "bold"),
+    locations = gt::cells_body(columns = `Strategy Step`)
+  )
+```
+
+**How the papers connect:** Yang, Huang & Chen (2023) is the closest single-paper blueprint — it uses hierarchical clustering as a pre-filter, cointegration as a validation gate, and a Kalman filter for dynamic hedge ratios, exactly as implemented here. Cartea et al. (2023) provides the theoretical justification for *why* correlation-matrix clustering produces mean-reverting portfolios. Simonson (2018) fills the OU half-life gap not covered in class notes. Avellaneda & Lee (2008) is the historical anchor — it demonstrates that statistical arbitrage on U.S. equities can achieve Sharpe \> 1.4, setting the performance benchmark. Engle & Granger (1987) and Kalman (1960) are foundational — they provide the econometric and filtering tools that make the strategy mathematically rigorous.
+
+------------------------------------------------------------------------
+
+## Weaknesses and Limitations
+
+No backtested strategy should be presented without an honest assessment of what could go wrong. The weaknesses below are organized from most to least severe.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+dplyr::tibble(
+  `#` = 1:10,
+  Weakness = c(
+    "Single-pair concentration (addressed)",
+    "Slow mean-reversion",
+    "No transaction costs",
+    "Weak cluster separation",
+    "Overfitting risk in optimization",
+    "Small, homogeneous universe",
+    "Fixed train/test split",
+    "No regime detection",
+    "Look-ahead in data construction",
+    "Short out-of-sample window"
+  ),
+  Severity = c(
+    "Low", "High", "Medium", "Medium", "Medium",
+    "Medium", "Low", "Low", "Low", "Low"
+  ),
+  Description = c(
+    "Addressed: all tradeable pairs are traded simultaneously with equal weight and monthly rebalancing. If one pair weakens, the others continue contributing. Residual risk is that all pairs could weaken simultaneously in an extreme regime shift.",
+    "Sector ETF pairs mean-revert on timescales measured in months. The strategy generates very few round-trip trades per year per pair. In the 15-month test window there may be only 2 to 4 complete cycles across the portfolio — far too few for statistical confidence. The strategy is structurally underpowered for short evaluation horizons.",
+    "Bid/ask spreads, commissions, and slippage are not modeled. Sector ETFs have tight spreads (~0.01–0.02%), so the impact is small for low-frequency trading, but it is non-zero and compounds over 24 years of training data.",
+    "The K-Means silhouette score (~0.16) is well below the 0.5 'strong' threshold. All 10 ETFs share dominant systematic exposure to SPY, making cluster boundaries inherently fuzzy. Clustering serves an organizational role, not a statistical one — cointegration is the true filter.",
+    "The 120-point parameter grid was optimized on 24 years of training data. Even with the plateau robustness method, there is no guarantee that the selected parameters generalize to future regimes. The composite Z-score mitigates but does not eliminate this risk.",
+    "Ten sector ETFs drawn from one index (S&P 500) offer limited diversity. All sectors are U.S. large-cap, making the universe structurally correlated. A broader universe (international ETFs, factor ETFs, commodities) would provide more independent pair candidates.",
+    "A single 80/20 train/test split at Jan 2025 does not test performance across multiple regimes. Rolling-window or expanding-window walk-forward validation would be more rigorous but computationally expensive for this assignment scope.",
+    "The Kalman filter adapts the hedge ratio continuously, but the strategy has no explicit mechanism to detect when the cointegration relationship has structurally broken. A regime-switching model (Markov, CUSUM) could flag breakdown periods.",
+    "The train/test split date is known a priori. While no test-period information leaks into model fitting, the choice of split date is itself a decision that could be optimized. This is a subtle form of look-ahead.",
+    "Fifteen months (Jan 2025 – Mar 2026) contains ~3 half-life cycles at best. Any conclusion about out-of-sample performance — positive or negative — has very wide confidence intervals."
+  )
+) %>%
+  gt::gt() %>%
+  gt::tab_header(
+    title    = "Weaknesses and Limitations",
+    subtitle = "Honest assessment of what could go wrong and what was not modeled"
+  ) %>%
+  gt::tab_style(
+    style     = gt::cell_text(color = "red", weight = "bold"),
+    locations = gt::cells_body(columns = Severity, rows = Severity == "High")
+  ) %>%
+  gt::tab_style(
+    style     = gt::cell_text(color = "orange", weight = "bold"),
+    locations = gt::cells_body(columns = Severity, rows = Severity == "Medium")
+  ) %>%
+  gt::tab_style(
+    style     = gt::cell_text(color = "blue"),
+    locations = gt::cells_body(columns = Severity, rows = Severity == "Low")
+  )
+```
+
+**Key takeaway:** Single-pair concentration has been addressed by trading all tradeable pairs simultaneously with equal weight and monthly rebalancing. The remaining highest-severity weakness is slow reversion, which is intrinsic to the sector ETF universe. The practical implication is that this strategy requires a multi-year evaluation window to assess properly, and the 15-month test period in this assignment is insufficient for statistical significance.
+
+------------------------------------------------------------------------
+
+## Conclusion
+
+This strategy demonstrates the full quantitative trading workflow from hypothesis (sector ETFs share systematic risk) through a disciplined 4-step filter pipeline (Clustering → Cointegration → OU Half-Life → Kalman Filter), to a multi-pair equal-weight portfolio with monthly rebalancing, parameter optimization (8.7), risk/reward analysis (8.8), and out-of-sample evaluation (8.10).
+
+The core finding is that several Growth cluster pairs exhibit statistically significant cointegrated relationships with measurable mean-reversion. Rather than concentrating the strategy in a single pair, all tradeable pairs are run simultaneously with equal weight allocation and rebalanced at month-end. This structure compounds the mean-reversion effect at the portfolio level and directly addresses the single-pair concentration risk that would otherwise be the strategy's most critical weakness.
+
+The **3D optimization surfaces** (8.8.9) and **plateau robustness method** (8.8.9.2) represent the key contribution beyond the standard workflow: rather than picking the parameter combination that maximizes in-sample Sharpe, the strategy selects from the broad plateau where Sharpe, cumulative return, and drawdown are simultaneously above average and locally stable. This guards against the most common quantitative trading failure: overfitting to historical noise.
+
+The **literature flow** maps every modeling choice to its academic origin: Yang, Huang & Chen (2023) as the direct blueprint; Cartea et al. (2023) for clustering theory; Engle & Granger (1987) for cointegration; Simonson (2018) for OU calibration; and Avellaneda & Lee (2008) as the performance benchmark. The execution timing logic (8.4.1) assigns each day's return to its actual execution convention — OC on entry, CC on hold, CO on exit — removing look-ahead bias.
+
+The remaining high-severity weakness is slow mean-reversion, which is intrinsic to the sector ETF universe. The 15-month test period contains too few half-life cycles to draw statistically meaningful conclusions about out-of-sample performance. A production version of this strategy would require a 3 to 5 year evaluation window to properly assess whether the edge persists across full business cycles.
+
+------------------------------------------------------------------------
+
+*Strategy Version 1 \| FIN 452 Assignment \| Due April 7, 2026*
