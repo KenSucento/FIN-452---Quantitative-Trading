@@ -136,10 +136,17 @@ All computed on `result.opt` (full train rerun with selected parameters):
 | %.InMrkt | 0.6611 | 0.6355 |
 | DD.Length | 1,545 | 96 |
 
-### Why Degradation Occurred
-- Regime change: tariff shocks, rate cuts, sector rotation in 2025–2026
-- Short test window: ~3 half-life cycles max per pair — insufficient for statistical confidence
-- Parameter fit: optimal params from 24-yr training regime; some fit does not transfer
+### Why the Return is This Low (Honest Assessment)
+- The US risk-free rate in 2025 was ~4.25–4.50%. The strategy earned 1% annualized gross, which does not beat cash. Sharpe of 0.2145 uses Rf = 0; on a real risk-free rate basis, risk-adjusted return is negative.
+- The sector ETF universe is small, liquid, and heavily covered. Mean-reversion relationships exist but the magnitude of alpha has compressed to the point where gross returns barely clear zero after costs.
+- Transaction costs were not modeled. At 1% gross annualized across 63% time-in-market, even minimal ETF bid/ask spreads would likely eliminate most or all net return.
+- Regime change: tariff shocks and policy-driven sector rotation in 2025–2026 created spread dislocations that stayed wide rather than reverting.
+- Short test window: ~3 half-life cycles max per pair — insufficient for statistical confidence either way.
+
+### Benchmark Comparison (Jan 2025 – Mar 2026)
+- SPY and an equal-weight basket of all 9 clustering ETFs (XLB, XLE, XLF, XLI, XLK, XLP, XLV, XLU, XLY) both materially outperformed the strategy over the same window.
+- Equal-weight sector index uses zero modeling overhead and the exact same building blocks as the strategy.
+- Market neutrality by design means forgoing beta in a bull market regime. At 1% gross, the tradeoff does not justify the complexity.
 
 ---
 
@@ -153,11 +160,17 @@ The optimization grid chunk has `#| cache: true`. If you see the out-of-sample s
 
 | Weakness | Severity |
 |---|---|
-| Narrow universe (10 large-cap US sectors) | High |
-| Fixed train/test split | Medium |
-| No regime detection | Medium |
-| Look-ahead in data construction | Medium |
-| Short out-of-sample window (15 months) | Medium |
+| Slow mean-reversion | High |
+| No transaction costs | High |
+| Narrow universe (10 large-cap US sectors) | Medium |
+| Overfitting risk in optimization | Medium |
+| Weak cluster separation (silhouette 0.16) | Medium |
+| Fixed train/test split | Low |
+| No regime detection | Low |
+| Look-ahead in data construction | Low |
+| Short out-of-sample window (15 months) | Low |
+
+Note: Transaction costs upgraded from Medium to High. At ~1% annualized gross with 63% time-in-market, even tight ETF spreads across multiple pairs would likely make net return negative.
 
 ---
 
@@ -191,8 +204,14 @@ The optimization grid chunk has `#| cache: true`. If you see the out-of-sample s
 7. Step 4 — Kalman Filter and Strategy
 8. Optimization (8.7 grid, 8.8 heatmaps, 8.9 3D surfaces, Z-score, plateau, risk appetite)
 9. Risk / Reward Measures (Sharpe, Omega, DD, SPY correlation)
-10. Out-of-Sample Evaluation (8.10 train vs test table + equity curve)
-11. Literature Flow (mermaid LR diagram)
-12. Weaknesses (gt table)
-13. Conclusion
-14. Things to Improve on
+10. Out-of-Sample Evaluation (train vs test table + equity curve + honest interpretation)
+11. Benchmark Comparison (strategy vs SPY vs equal-weight sector index — overlay chart + metrics table)
+12. Literature Flow (mermaid LR diagram)
+13. Weaknesses (gt table)
+14. Lessons Learned (general reflections on building a full quant strategy — not technical)
+15. Conclusion
+16. Things to Improve on
+
+### New Sections Added (April 7, 2026)
+- **Benchmark Comparison**: R code computes `ew.daily` (equal-weight mean of 9 sector ETFs daily) and `spy.test` returns over test period. Aligns with `result.test` on shared dates into `df.bench`. Produces overlay equity curve (blue/red/green) and side-by-side `RTL::tradeStats()` comparison table. Located before Literature Flow.
+- **Lessons Learned**: Prose-only section (no code). Four paragraphs covering: backtesting is optimistic, complexity needs result-based justification, honest self-assessment is a skill, and regime dependence makes single test windows inconclusive. Located before Conclusion.
