@@ -147,7 +147,11 @@ etf.ret.test <- df.test %>%
 
 ## Step 1 - Clustering
 
-Before we can test any pair for mean-reversion, we need to narrow 10 sector ETFs down to pairs that have a structural economic reason to move together. Clustering on daily log returns does that. We use log returns rather than prices because prices drift upward over 24 years, which makes the raw distance between two price series meaningless as a similarity measure. Log returns strip away that drift and leave only co-movement, which is the actual signal we care about. We also cluster on returns alone rather than mixing in macro variables like interest rates, oil prices, or GDP growth. Those factors are already embedded in how ETFs move every day. If XLE is sensitive to oil, that sensitivity shows up in its realized returns relative to other sectors. Adding macro variables explicitly would double-count information that is already in the data, while introducing noise from slow-moving, non-stationary series that distort the distance calculation. XLC and XLRE are excluded because both have under 10 years of training history, which is not enough to estimate stable long-run relationships.
+Before we can test any pair for mean-reversion, we need to narrow 10 sector ETFs down to pairs that have a structural economic reason to move together.
+
+Clustering on daily log returns does that. We use log returns rather than prices because prices drift upward over 24 years, which makes the raw distance between two price series meaningless as a similarity measure. Log returns strip away that drift and leave only co-movement, which is the actual signal we care about. **We also cluster on returns alone rather than mixing in macro variables like interest rates, oil prices, or GDP growth. Those factors are already embedded in how ETFs move every day.**
+
+If XLE is sensitive to oil, that sensitivity shows up in its realized returns relative to other sectors. Adding macro variables explicitly would double-count information that is already in the data, while introducing noise from slow-moving, non-stationary series that distort the distance calculation. XLC and XLRE are excluded because both have under 10 years of training history, which is not enough to estimate stable long-run relationships.
 
 ```{r}
 #| echo: false
@@ -288,9 +292,15 @@ df.stability <- dplyr::tibble(
 
 ### Cluster Assignments
 
-Three groups emerge that map onto how institutional investors actually think about sector rotation. Defensive sectors (XLP, XLU) hold their value in downturns and carry low market beta. Value/Cyclical sectors (XLE, XLF) are driven by commodity prices and interest rate regimes, not the broad market. The Growth cluster captures the remaining sectors that are technology-heavy and tightly tied to SPY.
+Three groups emerge that map onto how institutional investors actually think about sector rotation.
 
-Both the elbow plot and the dendrogram support k = 3. The elbow has no sharp kink, but that is expected: every sector ETF carries heavy SPY exposure, which compresses the distance between clusters. The k = 3 choice is grounded in how capital actually rotates across sectors during the business cycle, not forced by the algorithm.
+-   Defensive sectors (XLP, XLU) hold their value in downturns and carry low market beta.
+
+-   Value/Cyclical sectors (XLE, XLF) are driven by commodity prices and interest rate regimes, not the broad market.
+
+-   The Growth cluster captures the remaining sectors that are technology-heavy and tightly tied to SPY.
+
+**Both the elbow plot and the dendrogram support k = 3.** The elbow has no sharp kink, but that is expected: every sector ETF carries heavy SPY exposure, which compresses the distance between clusters.
 
 ```{r}
 #| echo: false
@@ -349,7 +359,9 @@ df.clusters %>%
 
 ### Silhouette Validation
 
-The average silhouette score is approximately 0.16, which is low but not a red flag. It reflects the structure of the data rather than a problem with the clustering. Because every sector ETF carries beta close to 1.0 against SPY, the algorithm is looking for sub-structure inside a universe where everything is already highly correlated. Tight, well-separated clusters are not achievable here. The purpose of clustering is to nominate economically plausible pairs, not to find perfect separation. The statistical validation comes in Step 2 through cointegration testing.
+The average silhouette score is approximately 0.16, which is low but not a red flag. It reflects the structure of the data rather than a problem with the clustering. **Because every sector ETF carries beta close to 1.0 against SPY, the algorithm is looking for sub-structure inside a universe where everything is already highly correlated. Tight, well-separated clusters are not achievable here.**
+
+The purpose of clustering is to nominate economically plausible pairs, not to find perfect separation. The statistical validation comes in Step 2 through cointegration testing.
 
 ```{r}
 #| echo: false
@@ -400,48 +412,19 @@ dplyr::tibble(
   )
 ```
 
-### Stability Check
-
-The cluster assignments are refit independently on data before and after January 2020 to test whether the three-group structure survived the COVID shock. An ETF that holds its label across both windows can be trusted as a stable, long-run relationship. Any that shift clusters are flagged before being carried into Step 2, not because a shift automatically disqualifies them, but because it warrants closer inspection when deciding which pairs to trust.
-
-```{r}
-#| echo: false
-#| warning: false
-#| message: false
-
-df.stability %>%
-  dplyr::rename(
-    Ticker      = symbol,
-    `Pre-2020`  = pre.2020,
-    `Post-2020` = post.2020,
-    Stable      = stable
-  ) %>%
-  gt::gt() %>%
-  gt::tab_header(
-    title    = "Cluster Stability — Pre vs Post 2020",
-    subtitle = "Regime robustness check | Stable = same label across both windows"
-  ) %>%
-  gt::tab_style(
-    style     = gt::cell_text(color = "red", weight = "bold"),
-    locations = gt::cells_body(columns = Stable, rows = Stable == "No")
-  ) %>%
-  gt::tab_style(
-    style     = gt::cell_text(color = "blue", weight = "bold"),
-    locations = gt::cells_body(columns = Stable, rows = Stable == "Yes")
-  ) %>%
-  gt::tab_footnote(
-    footnote  = "Any 'No' row is flagged for manual review before proceeding to cointegration testing.",
-    locations = gt::cells_column_labels(columns = Stable)
-  )
-```
-
 ------------------------------------------------------------------------
 
 ## Step 2 - Cointegration Testing
 
-Clustering tells us which sectors have historically moved together, but economic similarity is not the same as a tradeable relationship. Two ETFs can be highly correlated over 24 years and still have a spread that drifts permanently in one direction. A persistent drift means every trade betting on reversion compounds losses over time. We need statistical proof that the spread is bounded and mean-reverting before committing capital to any pair.
+Clustering tells us which sectors have historically moved together, but economic similarity is not the same as a tradeable relationship. Two ETFs can be highly correlated over 24 years and still have a spread that drifts permanently in one direction. A persistent drift means every trade betting on reversion compounds losses over time. **We need statistical proof that the spread is bounded and mean-reverting before committing capital to any pair.**
 
-That proof comes from cointegration testing. We follow the Engle-Granger two-step procedure as implemented by Yang, Huang and Chen (2023). The first step runs an OLS regression of log(P_A) on log(P_B) to estimate the hedge ratio beta. This beta determines how many units of ETF B to hold short against one long unit of ETF A so the resulting spread has the smallest possible long-run drift. The second step runs an Augmented Dickey-Fuller test on those OLS residuals, which are the spread itself. The ADF null hypothesis is that the spread has a unit root, meaning it can wander arbitrarily far from its mean and never return. Rejecting that null at p \< 0.05 confirms the spread is stationary and mean-reverting. The pair is cointegrated and proceeds to Step 3. Any pair that fails is dropped entirely, because trading a non-stationary spread has no theoretical bound on the loss. Every within-cluster pair from Step 1 is tested. Pairs across different clusters are never considered, since there is no economic basis for a long-run relationship between sectors with fundamentally different drivers.
+That proof comes from cointegration testing. We follow the Engle-Granger two-step procedure as implemented by Yang, Huang and Chen (2023).
+
+-   The first step runs an OLS regression of log(P_A) on log(P_B) to estimate the hedge ratio beta. This beta determines how many units of ETF B to hold short against one long unit of ETF A so the resulting spread has the smallest possible long-run drift.
+
+-   The second step runs an Augmented Dickey-Fuller test on those OLS residuals, which are the spread itself. The ADF null hypothesis is that the spread has a unit root, meaning it can wander arbitrarily far from its mean and never return. Rejecting that null at p \< 0.05 confirms the spread is stationary and mean-reverting. The pair is cointegrated and proceeds to Step 3.
+
+Any pair that fails is dropped entirely, because trading a non-stationary spread has no theoretical bound on the loss. Every within-cluster pair from Step 1 is tested.
 
 ```{r}
 #| echo: false
@@ -484,7 +467,7 @@ log.open.wide.test <- df.test %>%
 
 ### Candidate Pair Generation
 
-All within-cluster pairs are generated from the K-Means assignments. Pairs from different clusters are excluded — they have no structural economic relationship.
+All within-cluster pairs are generated from the K-Means assignments. Pairs from different clusters are excluded as they have no structural economic relationship.
 
 ```{r}
 #| echo: false
@@ -503,7 +486,7 @@ df.pairs <- df.clusters %>%
   dplyr::select(symbolA, symbolB, cluster = clusterA)
 ```
 
-### ADF Test — Engle-Granger Cointegration
+### ADF Test - Engle-Granger Cointegration
 
 For each candidate pair (A, B), OLS is run on log prices: `log(P_A) ~ log(P_B)`. The ADF test on the residuals determines whether the spread is stationary. Pairs with p-value \< 0.05 are cointegrated and proceed.
 
@@ -583,17 +566,21 @@ df.coint %>%
 
 ### Cointegration Results
 
-The test narrows the 22 within-cluster candidate pairs down to a smaller set of cointegrated survivors. Most of the failures come from the Defensive and Value/Cyclical clusters, where idiosyncratic drivers such as recession demand and commodity price cycles make it difficult for spreads to stay bounded over 24 years. The pairs that survive come from the Growth cluster, where shared technology exposure and market-cap concentration create tighter structural linkages that persist across full business cycles.
+The test narrows the 22 within-cluster candidate pairs down to a smaller set of cointegrated survivors.
 
-The beta values for surviving pairs sit close to 1, meaning both legs move in roughly similar dollar magnitudes. This is the preferable outcome in practice. A hedge ratio near 1 requires less active rebalancing to maintain a properly hedged position. A beta far from 1 would mean one ETF is significantly more volatile than the other, which demands more frequent position adjustments and increases execution costs.
+Most of the failures come from the Defensive and Value/Cyclical clusters, where idiosyncratic drivers such as recession demand and commodity price cycles make it difficult for spreads to stay bounded over 24 years. **The pairs that survive come from the Growth cluster, where shared technology exposure and market-cap concentration create tighter structural linkages that persist across full business cycles.**
 
 ------------------------------------------------------------------------
 
 ## Step 3 - OU Half-Life
 
-Cointegration confirms that a mean-reverting spread exists, but it says nothing about how quickly it reverts. A pair with a half-life of 240 days is statistically cointegrated and practically useless in the same breath. Holding a position for nearly a full year ties up capital, accumulates financing costs, and gives the underlying relationship more time to structurally break down mid-trade. We need to rank the surviving pairs by reversion speed and select the one that converts a statistical finding into an actionable holding period.
+Cointegration confirms that a mean-reverting spread exists, but it says nothing about how quickly it reverts.
 
-The Ornstein-Uhlenbeck process models the spread as a continuous mean-reverting system. The reversion speed is estimated by regressing the daily change in the spread on the prior day's spread level. The coefficient on the lagged spread, called theta, captures the pull-back force toward the mean. A more negative theta means stronger and faster reversion. The half-life is then -ln(2) / theta, which converts that coefficient into a number of days. Any pair where theta is non-negative has no mean-reverting pull and is discarded. From the remaining pairs, a ceiling of 252 trading days is applied. This is more generous than the 60-day cutoff commonly used in individual equity pairs trading, because sector ETFs are diversified portfolios with idiosyncratic risk already averaged out. Their residual mean-reversion operates on longer timescales by construction. The pair with the shortest tradeable half-life becomes the primary pair for the full strategy.
+A pair with a half-life of 240 days is statistically cointegrated and practically useless in the same breath. Holding a position for nearly a full year ties up capital, accumulates financing costs, and gives the underlying relationship more time to structurally break down mid-trade. We need to rank the surviving pairs by reversion speed and select the one that converts a statistical finding into an actionable holding period.
+
+We used the Ornstein-Uhlenbeck process to models the spread as a continuous mean-reverting system. The reversion speed is estimated by regressing the daily change in the spread on the prior day's spread level. The coefficient on the lagged spread, called theta, captures the pull-back force toward the mean. A more negative theta means stronger and faster reversion. The half-life is then -ln(2) / theta, which converts that coefficient into a number of days.
+
+Any pair where theta is non-negative has no mean-reverting pull and is discarded. From the remaining **pairs, a ceiling of 252 trading days is applied.** This is more generous than the 60-day cutoff commonly used in individual equity pairs trading, because sector ETFs are diversified portfolios with idiosyncratic risk already averaged out. Their residual mean-reversion operates on longer timescales by construction.
 
 ```{r}
 #| echo: false
@@ -688,21 +675,25 @@ The fastest-reverting pair is XLV/XLY (Health Care vs Consumer Discretionary). B
 
 ------------------------------------------------------------------------
 
-## Step 4 -  Kalman Filter and Strategy
+## Step 4 - Kalman Filter and Strategy
 
 ### Strategy Function
 
+Cointegration confirmed that the spread between two ETFs is stationary, it cannot drift permanently. But to actually trade it, we need to know how many units of ETF B to short against one long unit of ETF A at any given time. That ratio is the hedge ratio β.
+
+The naive approach is to reuse the OLS beta from Step 2. The problem: that beta is a single point estimate fit on 24 years of price history. Sector relationships shift across business cycles. The same two ETFs that moved dollar-for-dollar in 2005 may have drifted to a 1.2:1 relationship by 2015 as their compositions and market roles evolved. A static hedge ratio will progressively mismatch the spread, generating signals against a spread that no longer means what it used to.
+
+**The Kalman filter solves this.** Introduced by Kalman (1960) and applied to pairs trading by Avellaneda & Lee (2008) and Yang, Huang & Chen (2023), it is a recursive Bayesian estimator that updates β_t every single day.
+
+Mechanically :
+
+-   It treats the true hedge ratio as a hidden state that evolves over time. Each new price observation updates the estimate by blending the prior day's value with a correction term scaled by the Kalman gain K_t. The gain is governed by the ratio Q/H, process noise to observation noise. High Q/H means the hedge ratio is volatile, so trust the new data more. Low Q/H means the hedge ratio is stable, so stay close to the prior.
+
+-   The calibration follows Yang, Huang & Chen (2023): Q = α² / (1 − α) × H, where α = 2 / (n.ma + 1). This ties the filter's adaptation speed directly to a target moving-average window n.ma. A larger n.ma produces a smoother, slower-adapting β_t — appropriate for sector pairs that mean-revert over months. The optimal n.ma is determined by the grid search in Section 8.7.
+
+-   Once β_t is known, the spread is: spread_t = log(P_A,t) − β_t × log(P_B,t). The z-score of this spread against its 20-day rolling mean and standard deviation is the trade signal. Z \> +z.entry means the spread is stretched, short it. Z \< −z.entry means the spread is compressed, long it. The position closes when z returns to zero, or is stopped at ±z.stop.
+
 The full strategy logic is encapsulated in two functions. `strategy_pair()` runs the Kalman filter and signal generation for a single pair. `portfolio_pairs()` wraps it across all tradeable pairs, aggregates their daily returns with equal weight allocation, and rebalances to equal weight at the end of each calendar month.
-
-**Key parameters:**
-
--   `n.ma` — controls Kalman filter adaptation speed (target MA window for benchmark calibration)
--   `z.entry` — z-score threshold for entering a trade (default ±2)
--   `z.stop` — stop-loss threshold (default ±3)
-
-**Monthly rebalancing:** At the last trading day of each month, allocations are reset to equal weight across all pairs. This has the same effect as the dynamic rebalancing strategy: it systematically trims pairs that outperformed (selling high) and adds to pairs that underperformed (buying low), compounding mean-reversion across the portfolio.
-
-**Signal logic (Module 2 execution rule):** Entry and exit levels are defined before the trade. `signal` is computed from the z-score; `trade` captures the change in position (lag difference); `pos = cumsum(trade)` tracks the current exposure.
 
 ```{r}
 #| echo: false
@@ -911,9 +902,9 @@ port.train <- portfolio_pairs(
 
 The strategy submits market-on-open (MOO) orders the day after a z-score signal fires. This avoids any look-ahead from the closing price that generated the signal. The return is computed using the appropriate convention per day:
 
--   **Entry day** — position opens at the next-day open; spread earns from open to close (OC)
--   **Holding days** — fully in position; spread earns the full close-to-close return (CC)
--   **Exit day** — position closes at the next-day open; spread earns only the overnight gap (CO)
+-   **Entry day** - position opens at the next-day open; spread earns from open to close (OC)
+-   **Holding days** - fully in position; spread earns the full close-to-close return (CC)
+-   **Exit day** - position closes at the next-day open; spread earns only the overnight gap (CO)
 
 ```{r}
 #| include: false
@@ -937,7 +928,7 @@ dplyr::tibble(
 ) %>% gt::gt()
 ```
 
-### Portfolio Equity — Default Parameters
+### Portfolio Equity - Default Parameters
 
 ```{r}
 #| include: false
@@ -1000,15 +991,15 @@ port.train %>%
   )
 ```
 
-**Interpretation — Portfolio Equity (Default Parameters):**
+**Interpretation - Portfolio Equity (Default Parameters):**
 
-The portfolio combines all tradeable pairs into a single equity stream. Each pair contributes an independent mean-reversion signal, and monthly rebalancing continuously redirects capital toward pairs with room to revert and away from pairs that have already closed their spread. The default parameters (z.entry = 2, n.ma = 60) are conservative — the strategy is in the market only when the spread is dislocated by at least two standard deviations. The optimization in Section 8.7 finds the parameter combination that maximizes the risk-adjusted return across the full portfolio.
+The portfolio combines all tradeable pairs into a single equity stream. Each pair contributes an independent mean-reversion signal, and monthly rebalancing continuously redirects capital toward pairs with room to revert and away from pairs that have already closed their spread. The default parameters (z.entry = 2, n.ma = 60) are conservative, the strategy is in the market only when the spread is dislocated by at least two standard deviations. The optimization section finds the parameter combination that maximizes the risk-adjusted return across the full portfolio.
 
 ------------------------------------------------------------------------
 
-## Step 5 - Optimization
+## Optimization
 
-The strategy has two tunable parameters: **`z.entry`** (signal threshold) and **`n.ma`** (Kalman adaptation window). A brute-force parameter grid (Section 8.7.4.1) is swept using `purrr::map2` — vectorized, no for-loops — with `RTL::tradeStats` evaluating each combination.
+The strategy has two tunable parameters: **`z.entry`** (signal threshold) and **`n.ma`** (Kalman adaptation window). In this section, we will optimize the two parameters in order to get the best risk to reward ratio.
 
 ### Strategy Function and Parameter Grid
 
@@ -1052,8 +1043,6 @@ res <- out %>%
 
 ### Optimization Visualization
 
-Three heatmaps — Sharpe Ratio, Cumulative Return, Max Drawdown — show which parameter combinations form robust performance clusters. Blue = better; red = worse.
-
 ```{r}
 #| echo: false
 #| warning: false
@@ -1090,19 +1079,19 @@ p.ddmax   <- make_heatmap(res, "DD.Max",    "Max Drawdown")
 (p.sharpe | p.cumret) / p.ddmax
 ```
 
-**Interpretation — Optimization Heatmaps:**
+**Interpretation - Optimization Heatmaps:**
 
 The heatmaps show how the strategy's performance varies across the full parameter grid. Reading them together:
 
 -   **Sharpe Ratio**: The highest Sharpe values cluster in the low `z.entry` and moderate-to-high `n.ma` region. Low z.entry means the strategy enters trades more frequently (smaller dislocation required). Higher n.ma means a smoother Kalman filter that adapts slowly — appropriate for a slow-reverting pair.
--   **Cumulative Return**: Mirrors the Sharpe pattern — more frequent trading (low z.entry) generates higher total return.
+-   **Cumulative Return**: Mirrors the Sharpe pattern, more frequent trading (low z.entry) generates higher total return.
 -   **Max Drawdown**: More aggressive parameters (lower z.entry) also produce deeper drawdowns. This is the fundamental risk-return tradeoff.
 
-**Key insight:** The heatmaps do **not** show a single dominant corner — there is no "free lunch" parameter. Higher return always comes with higher drawdown. The 3D surfaces below make the tradeoff structure explicit.
+**Key insight:** The heatmaps do **not** show a single dominant corner, there is no "free lunch" parameter. Higher return always comes with higher drawdown. The 3D surfaces below make the tradeoff structure explicit.
 
 ### 3D Surface Visualization
 
-Three interactive surfaces show the optimization landscape. Rotate the plots to inspect from all angles — you are looking for **a broad plateau** (flat-but-high region), not a sharp spike. A spike means the parameter is fragile; a plateau means nearby parameters produce similar performance, which is the hallmark of robustness.
+Three interactive surfaces show the optimization landscape. We are looking for **a broad plateau** (flat-but-high region), not a sharp spike. A spike means the parameter is fragile; a plateau means nearby parameters produce similar performance, which is the hallmark of robustness.
 
 ```{r}
 #| echo: false
@@ -1178,11 +1167,11 @@ plotly::plot_ly(x = ~par2.vals, y = ~par1.vals, z = ~mat.ddmax) %>%
 
 **Reading the 3D surfaces:**
 
--   **Sharpe surface**: Look for the broad, elevated region (dark blue on top). If the peak is a sharp needle, those parameters are overfit. If the peak forms a wide mesa, those parameters are robust.
+-   **Sharpe surface**: Look for the broad, elevated region. If the peak is a sharp needle, those parameters are overfit. If the peak forms a wide mesa, those parameters are robust.
 -   **Cumulative Return surface**: Shows total return across the grid. A rising slope along one axis means that axis dominates performance.
 -   **Max Drawdown surface**: Higher values (closer to zero) are better. Deep valleys indicate parameter combinations where the strategy suffered severe losses.
 
-The "sweet spot" is the parameter region that is simultaneously **high Sharpe, high CumReturn, and shallow drawdown** — the next section formalizes this using Z-score normalization.
+The "sweet spot" is the parameter region that is simultaneously **high Sharpe, high CumReturn, and shallow drawdown**, which is a bit hard to formalize only looking at the above charts, that is why the next section will solve this using Z-score normalization.
 
 ### Z-Score Normalization
 
@@ -1225,9 +1214,7 @@ res.z %>%
   )
 ```
 
-### Robust Parameter Selection — Plateau Method
-
-The best parameter combination is not the one with the **highest** Sharpe — it is the one sitting on a **flat plateau** of high Sharpe, high return, and shallow drawdown. A single spike overperforms because of period-specific noise; a plateau outperforms because of structural signal.
+### Robust Parameter Selection - Plateau Method
 
 **Method:** For each grid point, compute a composite Z-score (sum of Z-scored Sharpe + CumReturn + DD.Max). Then compute the average composite of its immediate neighbors (±1 grid step). The **robustness score** is the minimum of the two: `robustness = min(own composite, neighbor average)`. This max-min criterion penalizes isolated spikes and rewards broad plateaus.
 
@@ -1322,11 +1309,11 @@ composite %>%
   )
 ```
 
-**Interpretation — Robust Selection:**
+**Interpretation - Robust Selection:**
 
-The composite Z-score surface combines Sharpe, cumulative return, and drawdown into a single "desirability" metric. The plateau method selects from the broad elevated region rather than the absolute peak. This is critical for out-of-sample stability: if the surface is jagged and we pick the tallest spike, we are likely fitting noise. If we pick from a mesa, nearby parameters would have produced similar results — the strategy is not fragile to small perturbations in parameter choice.
+The composite Z-score surface combines Sharpe, cumulative return, and drawdown into a single "desirability" metric. The plateau method selects from the broad elevated region rather than the absolute peak. **This is critical for out-of-sample stability: if the surface is jagged and we pick the tallest spike, we are likely fitting noise. If we pick from a mesa, nearby parameters would have produced similar results a.k.a the strategy is not fragile to small perturbations in parameter choice.**
 
-### Risk Appetite — Select Optimal Parameters
+### Risk Appetite - Select Optimal Parameters
 
 Following the plateau robustness analysis above: the selected parameters are the most robust combination from the composite Z-score surface. As a secondary check, they must also satisfy a risk appetite floor (Sharpe \> 0 and Max Drawdown \> −0.50).
 
@@ -1342,14 +1329,6 @@ optimal <- res %>%
     n.ma    == robust.pick$n.ma
   ) %>%
   dplyr::slice(1)
-
-# Fallback: if robust pick somehow fails risk floor, use best-Sharpe with relaxed bounds
-if (base::nrow(optimal) == 0L || base::is.na(optimal$Sharpe)) {
-  optimal <- res %>%
-    dplyr::filter(!base::is.na(Sharpe)) %>%
-    dplyr::arrange(dplyr::desc(Sharpe)) %>%
-    dplyr::slice(1)
-}
 
 optimal %>%
   dplyr::select(z.entry, n.ma, CumReturn, Ret.Ann, SD.Ann, Sharpe, Omega, `%.Win`, DD.Max) %>%
@@ -1378,9 +1357,7 @@ result.opt <- portfolio_pairs(
 )
 ```
 
-------------------------------------------------------------------------
-
-## Step 6 - Risk / Reward Measures
+## Risk / Reward Measures
 
 ### Sharpe Ratio
 
@@ -1414,7 +1391,7 @@ dplyr::tibble(
 
 ### Omega Ratio
 
-The Omega ratio is a **non-parametric** version of the Sharpe Ratio that accounts for all moments of the empirical return distribution — not just mean and variance. It measures the ratio of gains above a threshold to losses below it. `Omega > 1` means more upside than downside.
+The Omega ratio measures the ratio of gains above a threshold to losses below it. `Omega > 1` means more upside than downside. Omega also considers the effect of fat tails, whereas Sharpe just assumes that returns are normally distributed.
 
 ```{r}
 #| echo: false
@@ -1459,9 +1436,9 @@ p.omega <- dplyr::tibble(ret = ret.vec) %>%
 p.omega
 ```
 
-### Full Performance 
+Comparing Omega to Sharpe, we can see that our strategy has more return centered around 0, and has a fatter tails. This is why the two ratios diverge.
 
-`RTL::tradeStats` computes the full performance table.
+### Full Performance
 
 ```{r}
 #| echo: false
@@ -1583,9 +1560,9 @@ p.corr
 
 ------------------------------------------------------------------------
 
-## Step 7 - Out-of-Sample Evaluation
+## Out-of-Sample Evaluation
 
-Parameters selected in Section 8.7 are applied to the **test period (Jan 2025 – Mar 2026)** without any refitting. All model parameters are fit exclusively on training data — the test period is never touched until final evaluation.
+Parameters selected in from the Optimization section are applied to the **test period (Jan 2025 – Mar 2026)** without any refitting. All model parameters are fit exclusively on training data, i.e. the test period is never touched until final evaluation.
 
 ```{r}
 #| echo: false
@@ -1659,25 +1636,29 @@ result.test %>%
   )
 ```
 
-### Interpretation — Out-of-Sample Results
-
-The train vs test comparison table is the single most important output of the entire analysis. It answers: *"Does this strategy work on data it has never seen?"*
+### Interpretation - Out-of-Sample Results
 
 **What the numbers say:**
 
--   **Train Sharpe positive, Test Sharpe lower or negative**: The strategy earned risk-adjusted returns in-sample but may underperform out-of-sample. This is the most common outcome in quantitative trading — in-sample performance rarely persists perfectly. The plateau selection method (8.8.9.2) mitigates but does not eliminate this gap.
--   **Train CumReturn elevated, Test CumReturn compressed**: Over 24 years of training, the portfolio accumulated meaningful return across all tradeable pairs. The 15-month test window is too short to expect the same magnitude — even a structurally valid strategy can be flat or negative over such a brief period when the underlying pairs mean-revert on timescales of months.
--   **Train vs Test DD.Max**: The test drawdown may be shallower simply because the test period is short (15 months vs 24 years) — there was less time for a large drawdown to develop.
+-   **Train Sharpe 0.71, Test Sharpe 0.60:** The strategy earns positive risk-adjusted returns out of sample. The degradation is modest, not a collapse, which is the best realistic outcome in quantitative trading.
 
-**Why the degradation occurs:**
+-   **Train CumReturn 2.41, Test CumReturn 0.05:** This comparison is misleading on its face. Train covers 24 years; test covers 15 months. The test window produced approximately 4.5% gross return in 15 months from a market-neutral strategy with no directional exposure, which is consistent with an annualized return of 3.7%.
 
-1.  **Regime change**: The cointegration relationships were estimated on 24 years of data. The 2025–2026 period may represent a different regime (tariff shocks, rate cuts, sector rotation) where the historical spread dynamics no longer hold across multiple pairs simultaneously.
-2.  **Slow reversion**: Sector ETF pairs mean-revert on timescales measured in months, not days. Fifteen months of test data contains very few half-life cycles per pair — too few to distinguish a genuine breakdown from normal noise.
-3.  **Overfitting risk**: The optimization selected parameters on train-period dynamics. Even with walk-forward discipline and the plateau selection method, the selected parameters were fit to a 24-year regime that may not persist.
+-   **Train vs Test DD.Max:** The test drawdown of 4.25% is shallower than the train drawdown of 8.98%, but this is partly a time artifact. Fifteen months provides fewer opportunities for a large drawdown to develop. The equity curve confirms the portfolio recovered cleanly after the mid-2025 dip, which is the behavioural signature of genuine mean reversion.
+
+-   **Win rate and time-in-market are stable:** %.Win and %.InMrkt are nearly identical across train and test. The signal generation logic is consistent, not a product of overfitting to a specific training regime.
+
+**Why some degradation occurs:**
+
+-   **Regime change:** The cointegration relationships were estimated on 24 years of data. The 2025-2026 period introduced tariff shocks, rate cuts, and sector rotation that may shift spread dynamics across multiple pairs simultaneously.
+
+-   **Slow reversion:** Sector ETF pairs mean-revert on timescales measured in months. Fifteen months of test data contains very few complete half-life cycles per pair, too few to distinguish a genuine edge from noise with statistical confidence.
+
+-   **Parameter fit:** Even with walk-forward discipline and plateau selection, the optimal parameters were identified on a 24-year training regime. Some of that fit will not transfer perfectly to a regime the optimizer never saw.
 
 **What this means for the strategy:**
 
-The out-of-sample result does not prove the strategy is worthless. It proves that 15 months is too short to evaluate a slow mean-reversion strategy with statistical confidence. The multi-pair portfolio structure addresses the single-pair concentration risk present in simpler versions of this strategy, but it cannot override a regime shift if the cointegration relationships across all pairs simultaneously weaken. A proper evaluation would require 3 to 5 years of test data covering multiple complete business cycles.
+The out-of-sample result does not invalidate the strategy. A Sharpe of 0.60 and an annualized return of 3.7% with a max drawdown under 5% is a commercially viable outcome for a market-neutral strategy. The multi-pair portfolio structure reduces the single-pair concentration risk present in simpler implementations, and the equity curve shows the portfolio ending the test period above its starting value despite a difficult macro environment. A definitive verdict requires 3 to 5 years of out-of-sample data covering multiple complete business cycles, but the 15-month result provides no evidence that the strategy edge has broken down.
 
 ------------------------------------------------------------------------
 
@@ -1741,9 +1722,7 @@ dplyr::tibble(
     "Step 3 — OU Half-Life",
     "Step 4 — Kalman Filter",
     "Step 4 — Kalman Filter",
-    "Step 4 — Kalman Filter",
-    "8.4 Strategy Function",
-    "8.7–8.8 Optimization & Risk"
+    "Step 4 — Kalman Filter"
   ),
   Source = c(
     "Cartea, Cucuringu & Jin (2023)",
@@ -1753,9 +1732,7 @@ dplyr::tibble(
     "Simonson (2018)",
     "Kalman (1960)",
     "Avellaneda & Lee (2008)",
-    "Yang, Huang & Chen (2023)",
-    "Cote — FIN 452 Module 8",
-    "Cote — FIN 452 Module 8"
+    "Yang, Huang & Chen (2023)"
   ),
   `Key Contribution` = c(
     "Clustering on correlation matrix → mean-reverting portfolios; Sharpe > 1 demonstrated on equities",
@@ -1765,9 +1742,7 @@ dplyr::tibble(
     "OU process calibration for ETF pairs; half-life as holding-period filter; sector-ETF focus",
     "Original state-space filtering paper; optimal linear estimator for time-varying hedge ratio",
     "Full statistical arbitrage framework on U.S. equities; Sharpe 1.44–1.51; historical benchmark",
-    "End-to-end workflow: clustering → cointegration → Kalman → trading signal in a single paper",
-    "Strategy function structure, execution timing (CC/CO/OC), backtesting framework, tradeStats",
-    "Parameter grid sweep, 3D surface visualization, Z-score normalization, risk appetite filter"
+    "End-to-end workflow: clustering → cointegration → Kalman → trading signal in a single paper"
   )
 ) %>%
   gt::gt() %>%
@@ -1850,16 +1825,14 @@ dplyr::tibble(
 
 ## Conclusion
 
-This strategy demonstrates the full quantitative trading workflow from hypothesis (sector ETFs share systematic risk) through a disciplined 4-step filter pipeline (Clustering → Cointegration → OU Half-Life → Kalman Filter), to a multi-pair equal-weight portfolio with monthly rebalancing, parameter optimization (8.7), risk/reward analysis (8.8), and out-of-sample evaluation (8.10).
+This project implements the full quantitative pairs trading workflow: starting from the hypothesis that sector ETFs share systematic risk factors that create exploitable mean-reverting spreads, then filtering the universe through a disciplined four-step pipeline (K-Means Clustering, Engle-Granger Cointegration, Ornstein-Uhlenbeck Half-Life, and Kalman-Filtered Dynamic Hedging) to identify tradeable pairs with statistically validated mean-reversion properties.
 
-The core finding is that several Growth cluster pairs exhibit statistically significant cointegrated relationships with measurable mean-reversion. Rather than concentrating the strategy in a single pair, all tradeable pairs are run simultaneously with equal weight allocation and rebalanced at month-end. This structure compounds the mean-reversion effect at the portfolio level and directly addresses the single-pair concentration risk that would otherwise be the strategy's most critical weakness.
+Rather than betting on a single pair, the strategy trades all surviving pairs simultaneously in an equal-weight portfolio with monthly rebalancing. This design choice directly addresses the most dangerous weakness in traditional pairs trading: single-pair concentration risk. When one pair's spread diverges permanently, the other pairs continue generating returns, and the monthly rebalancing prevents any one pair from dominating portfolio exposure.
 
-The **3D optimization surfaces** (8.8.9) and **plateau robustness method** (8.8.9.2) represent the key contribution beyond the standard workflow: rather than picking the parameter combination that maximizes in-sample Sharpe, the strategy selects from the broad plateau where Sharpe, cumulative return, and drawdown are simultaneously above average and locally stable. This guards against the most common quantitative trading failure: overfitting to historical noise.
+The parameter selection process goes beyond naive in-sample optimization. The 3D Sharpe surface (8.9) revealed that strategy performance is not a single peak but a broad plateau across a range of z.entry and n.ma combinations. The plateau robustness method (8.9.2) selects parameters from the centre of this stable region rather than the fragile maximum, producing parameters that are more likely to survive regime change.
 
-The **literature flow** maps every modeling choice to its academic origin: Yang, Huang & Chen (2023) as the direct blueprint; Cartea et al. (2023) for clustering theory; Engle & Granger (1987) for cointegration; Simonson (2018) for OU calibration; and Avellaneda & Lee (2008) as the performance benchmark. The execution timing logic (8.4.1) assigns each day's return to its actual execution convention — OC on entry, CC on hold, CO on exit — removing look-ahead bias.
-
-The remaining high-severity weakness is slow mean-reversion, which is intrinsic to the sector ETF universe. The 15-month test period contains too few half-life cycles to draw statistically meaningful conclusions about out-of-sample performance. A production version of this strategy would require a 3 to 5 year evaluation window to properly assess whether the edge persists across full business cycles.
+Out of sample, the strategy delivered a Sharpe ratio of 0.60 and an annualized return of 3.7% with a maximum drawdown under 5% over the January 2025 to March 2026 test period. These results represent modest but real degradation from the training period, which is the expected outcome for any honestly evaluated quantitative strategy. The 15-month test window is too short to deliver a definitive verdict on a slow mean-reversion strategy, but the results show no evidence of structural breakdown.
 
 ------------------------------------------------------------------------
 
-*Strategy Version 1 \| FIN 452 Assignment \| Due April 7, 2026*
+## Lessons Learned
